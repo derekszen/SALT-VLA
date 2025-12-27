@@ -1,0 +1,24 @@
+[project]
+name = "salt-vla"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.8.1",
+    "polars>=1.36.1",
+    "pytest>=9.0.2",
+    "ruff>=0.14.10",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+lint.select = ["E", "F", "I", "UP", "NPY", "TID"]
+lint.ignore = ["E731"] # Allow lambdas for quick research transforms
+
+[tool.ruff.lint.isort]
+known-first-party = ["SALT-VLA"]

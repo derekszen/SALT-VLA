@@ -16,3 +16,21 @@ UCF101.rar
 *.rar
 *.7z
 
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.cache/
+.venv/
+
+# Experiment/logging outputs
+wandb/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/

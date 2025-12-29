@@ -1,6 +1,0 @@
-{"time":"2025-12-29T01:37:45.831624513+08:00","level":"INFO","msg":"stream: starting","core version":"0.23.1"}
-{"time":"2025-12-29T01:37:46.412291979+08:00","level":"INFO","msg":"stream: created new stream","id":"fv59ukmu"}
-{"time":"2025-12-29T01:37:46.412343464+08:00","level":"INFO","msg":"handler: started","stream_id":"fv59ukmu"}
-{"time":"2025-12-29T01:37:46.412392685+08:00","level":"INFO","msg":"stream: started","id":"fv59ukmu"}
-{"time":"2025-12-29T01:37:46.412396602+08:00","level":"INFO","msg":"writer: started","stream_id":"fv59ukmu"}
-{"time":"2025-12-29T01:37:46.412402351+08:00","level":"INFO","msg":"sender: started","stream_id":"fv59ukmu"}

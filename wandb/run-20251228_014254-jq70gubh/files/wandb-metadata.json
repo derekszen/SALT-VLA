@@ -1,0 +1,15 @@
+{
+  "os":  "Linux-6.17.9-arch1-1-x86_64-with-glibc2.42",
+  "python":  "CPython 3.12.12",
+  "startedAt":  "2025-12-27T17:42:54.554590Z",
+  "program":  "-m src.train",
+  "git":  {
+    "remote":  "git@github.com:derekszen/SALT-VLA.git",
+    "commit":  "5719589102f5c6f6e7159fdbcacf022c094e2087"
+  },
+  "email":  "zengzhuoxi@gmail.com",
+  "root":  "/home/derekszen/Projects/SALT-VLA",
+  "host":  "omarchyNeptune",
+  "executable":  "/home/derekszen/Projects/SALT-VLA/.venv/bin/python",
+  "writerId":  "7yc9i359kf8vvhoe79sorlam3538ngn9"
+}

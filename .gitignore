@@ -1,0 +1,18 @@
+# Datasets and raw media artifacts
+data/
+datasets/
+ssv2/
+kinetics400_dataset/
+UCF101.rar
+*.mp4
+*.avi
+*.mkv
+*.webm
+*.mov
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.rar
+*.7z
+

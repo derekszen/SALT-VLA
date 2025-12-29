@@ -1,0 +1,10 @@
+cudagraph partition due to non gpu ops
+cudagraph partition due to DeviceCopy ops. Found from :
+   File "/home/derekszen/Projects/SALT-VLA/src/models/salt.py", line 173, in forward
+    teacher_latents = self._teacher_tokens(video)
+  File "/home/derekszen/Projects/SALT-VLA/src/models/salt.py", line 263, in _teacher_tokens
+    x = x + teacher.pos_embed.expand(x.shape[0], -1, -1).type_as(x).to(
+
+cudagraph partition into 2 partitions
+[train] step=0 loss=15.9932 clips/s=0.82
+[train] step=10 loss=15.0222 clips/s=83.28

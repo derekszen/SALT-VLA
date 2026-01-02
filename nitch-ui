@@ -1,0 +1,19 @@
+[0;1;32m●[0m opensnitchd.service - Application firewall OpenSnitch
+     Loaded: loaded (]8;;file://omarchyNeptune/usr/lib/systemd/system/opensnitchd.service\/usr/lib/systemd/system/opensnitchd.service]8;;\; [0;1;32menabled[0m; preset: [0;1;38:5:185mdisabled[0m)
+     Active: [0;1;32mactive (running)[0m since Mon 2025-12-29 11:51:33 CST; 5s ago
+ Invocation: 4b2a79a58ae9483a8109d70507695e94
+       Docs: ]8;;https://github.com/evilsocket/opensnitch/wiki\https://github.com/evilsocket/opensnitch/wiki]8;;\
+   Main PID: 171069 (opensnitchd)
+      Tasks: 29[0;38;5;245m (limit: 76190)[0m
+     Memory: 87.6M (peak: 92M)
+        CPU: 416ms
+     CGroup: /system.slice/opensnitchd.service
+             └─[0;38;5;245m171069 /usr/bin/opensnitchd -rules-path /etc/opensnitchd/rules[0m
+
+Dec 29 11:51:33 omarchyNeptune systemd[1]: Started Application firewall OpenSnitch.
+Dec 29 11:51:33 omarchyNeptune opensnitchd[171069]: [2025-12-29 03:51:33]  IMP  Starting opensnitch-daemon v1.7.2
+Dec 29 11:51:33 omarchyNeptune opensnitchd[171069]: [2025-12-29 03:51:33]  WAR  Error loading network aliases: open /etc/opensnitchd/network_aliases.json: no such file or directory
+Dec 29 11:51:33 omarchyNeptune opensnitchd[171069]: [2025-12-29 03:51:33]  INF  Loading network aliases from /etc/opensnitchd/network_aliases.json ...
+Dec 29 11:51:33 omarchyNeptune opensnitchd[171069]: [2025-12-29 03:51:33]  INF  Loading configuration file /etc/opensnitchd/default-config.json ...
+Dec 29 11:51:33 omarchyNeptune opensnitchd[171069]: [2025-12-29 03:51:33]  INF  Loading rules from /etc/opensnitchd/rules/ ...
+Dec 29 11:51:33 omarchyNeptune opensnitchd[171069]: found /usr/lib/libc.so.6

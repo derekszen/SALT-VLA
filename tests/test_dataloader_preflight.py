@@ -43,7 +43,7 @@ def test_dataloader_preflight() -> None:
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = prefetch_factor
-        loader_kwargs["multiprocessing_context"] = mp_context
+        loader_kwargs["multiprocessing_context"] = mp.get_context(mp_context)  # Fixed: get_context() returns object
 
     loader = DataLoader(
         dataset,

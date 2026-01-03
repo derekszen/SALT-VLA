@@ -117,7 +117,7 @@ class SALTModel(nn.Module):
     def __init__(
         self,
         teacher_name: str = "OpenGVLab/VideoMAEv2-Base", # Optimized choice
-        student_name: str = "vit_base_patch16_224",
+        student_model_name: str = "vit_base_patch16_224",  # Configurable student size
         tubelet_size: int = 2,
         patch_size: int = 16,
         num_frames: int = 16,
@@ -141,7 +141,7 @@ class SALTModel(nn.Module):
 
         # 2. Student setup
         self.student = StudentVideoViT(
-            model_name=student_name,
+            model_name=student_model_name,  # Use configurable student size
             tubelet_size=tubelet_size,
             patch_size=patch_size,
             num_frames=num_frames,

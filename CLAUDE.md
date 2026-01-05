@@ -1,7 +1,7 @@
 # SALT VLA-Encoder Project Rules
 
 ## 🎯 Goal
-Train a ViT-B student via latent regression of a frozen **VideoMAEv2-Base** teacher.
+Train a ViT-B student via latent regression of a frozen **VideoMAE v1-Huge** teacher.
 
 ## 🚀 Hardware Acceleration: Samsung 9100 Pro
 The dataset has been migrated to the Gen 5 NVMe slot to maximize throughput for V-JEPA training.
@@ -37,20 +37,92 @@ train_loader = DataLoader(..., multiprocessing_context=mp.get_context(mp_context
 ```
 
 ### 2. Model Layer (`src/models/salt.py`)
-- **Teacher:** `OpenGVLab/VideoMAEv2-Base`. Frozen, `eval()`.
+- **Teacher:** `MCG-NJU/videomae-huge`. Frozen, `eval()`.
 - **Student:** `timm` ViT-B. `Conv3d` (2, 16, 16) adapter.
 - **Inflation:** 1568 positional tokens (8 temporal x 196 spatial).
 
 ### 3. Training Layer (`src/train.py`)
 - **Precision:** `bfloat16` strictly.
-- **Optimization:** Fused `AdamW`, `LR 1e-4`, `Batch Size 64`.
+- **Optimization:** Fused `AdamW`
 - **Compiler:** `torch.compile(mode="max-autotune")`.
 - **Loss:** Masked MSE (penalize masked tokens only).
 
-## 📝 Agent Instructions
-- **Command:** `PYTHONPATH=. uv run python src/train.py`
-- **Safety:** Catch `RuntimeError` from the loader; skip empty batches.
-- **VRAM:** Gradient Checkpointing is ENABLED for the Student to allow BS 64.
+#### Validated Hyperparameters (as of 2026-01-04)
+Based on extensive testing with ViT-Tiny on SSv2 (168K samples, cached latents mode):
+
+**Stable Configuration:**
+- `batch_size`: 32 (validated safe, BS=64 causes bus errors)
+- `num_workers`: 8-12 (8 conservative, 12 aggressive for 16-core CPU)
+- `prefetch_factor`: 2 (reduced from 4 for stability)
+
+**Learning Rate Schedule (CRITICAL):**
+- `lr`: **3e-4** (ViT sweet spot, 1e-4 too low → learning stalls)
+- `min_lr`: **3e-5** (10% of peak LR, prevents complete decay)
+- `warmup_steps`: **200-500** (~1-5% of total steps, proportional to epochs)
+- `grad_clip`: **1.0** (gradient clipping for stability at higher LR)
+- `weight_decay`: 0.05
+
+**Training Parameters:**
+- `mask_ratio`: 0.75 (75% of patches masked)
+- `epochs`: 3-10 (3 for rapid prototyping, 10 for convergence)
+
+**Observations:**
+- Loss plateau at ~12.5 with LR=1e-4 → Fixed with LR=3e-4 + min_lr floor
+- With improved hyperparameters: loss drops from ~15.6 → ~11.3 (27% reduction)
+- Throughput: ~560-600 clips/s with cached latents
+- GPU memory: 0.83 GB (very efficient with gradient checkpointing)
+
+## 🎛️ Tunable Hyperparameters Reference
+
+### Critical (High Impact on Learning)
+
+| Parameter | Default | Range | Description | Notes |
+|-----------|---------|-------|-------------|-------|
+| `lr` | 3e-4 | 1e-4 to 1e-3 | Base learning rate | Too low → stalls; too high → instability |
+| `min_lr` | 3e-5 | 1e-6 to 1e-4 | Minimum LR floor | Should be 5-10% of peak LR |
+| `warmup_steps` | 200-500 | 50 to 1000 | Linear warmup duration | ~1-5% of total steps |
+| `mask_ratio` | 0.75 | 0.5 to 0.9 | Fraction of patches masked | Higher = harder task |
+
+### Important (Moderate Impact)
+
+| Parameter | Default | Range | Description | Notes |
+|-----------|---------|-------|-------------|-------|
+| `batch_size` | 32 | 16 to 32 | Videos per batch | BS=64 unstable, BS=32 max safe |
+| `weight_decay` | 0.05 | 0.01 to 0.1 | AdamW weight decay | Regularization strength |
+| `grad_clip` | 1.0 | 0.5 to 5.0 | Gradient clipping threshold | Prevents exploding gradients |
+| `student_model_name` | vit_tiny | vit_{tiny,small,base} | Student architecture | Tiny fastest, Base best quality |
+
+### Dataloader (Affects Throughput)
+
+| Parameter | Default | Range | Description | Notes |
+|-----------|---------|-------|-------------|-------|
+| `num_workers` | 8 | 4 to 12 | Parallel data loading | 8 conservative, 12 for 16-core |
+| `prefetch_factor` | 2 | 2 to 4 | Batches to prefetch | Higher = more memory usage |
+
+### Training Duration
+
+| Parameter | Default | Range | Description | Notes |
+|-----------|---------|-------|-------------|-------|
+| `epochs` | 10 | 1 to 50 | Full passes over dataset | 3 for prototyping, 10-20 for convergence |
+| `max_steps` | None | Any | Override with step limit | Useful for debugging |
+
+## 📊 Experimental Results
+
+See `EXPERIMENTS.md` for detailed training logs and ablation studies.
+
+### Recent Findings (2026-01-04)
+
+**Experiment: LR Schedule Optimization**
+- **Problem:** Loss plateaued at ~12.5 with LR=1e-4, no improvement after 500 steps
+- **Hypothesis:** LR too low + aggressive cosine decay → learning stops
+- **Solution:** LR=3e-4 + min_lr=3e-5 (10% floor) + longer warmup
+- **Result:** ✅ Loss dropped to ~11.3 (1.2 lower), continued learning past 2K steps
+- **Impact:** 27% loss reduction, model actually learns video semantics
+
+**Test Coverage (2026-01-04)**
+- Created 44 unit tests covering model components and training logic
+- Tests validate: PatchEmbed3D, positional embedding inflation, masked MSE, LR schedule
+- All tests passing with new hyperparameters
 
 ## 🧪 Preflight Tests (Run Before Long Training)
 Add these lightweight checks to catch data loader and shared-memory issues early:

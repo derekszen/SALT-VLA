@@ -14,7 +14,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.data.loader import SSv2Dataset, collate_drop_none
+from src.data.loader import (
+    SSv2Dataset,
+    SSv2MaskedDataset,
+    collate_drop_none,
+    collate_drop_none_with_masks,
+)
 from src.models.salt import SALTModel
 
 # REMOVED: file_system sharing strategy - causes disk quota issues
@@ -33,18 +38,39 @@ def _setup_wandb(project: str, run_name: str | None) -> None:
 def train(
     data_root: str | Path = "/mnt/ssv2",
     split: str = "train",
-    batch_size: int = 16,  # ULTRA-CONSERVATIVE: Reduced from 32 to prevent system freezes
-    num_workers: int = 4,  # ULTRA-CONSERVATIVE: Reduced from 8 for maximum stability
+    batch_size: int = 16,
+    num_workers: int = 4,
     epochs: int = 1,
     lr: float = 1e-4,
-    weight_decay: float = 0.05,
+    min_lr: float = 1e-5,
+    # Weight decay schedule (paper: 0.04 → 0.4 cosine)
+    weight_decay_start: float = 0.04,
+    weight_decay_end: float = 0.4,
     warmup_steps: int = 100,
     max_steps: int | None = None,
     log_interval: int = 10,
     mask_ratio: float = 0.75,
-    use_cached_latents: bool = False,  # NEW: Toggle for cached latents mode
-    cache_dir: str | Path = "/mnt/ssv2/cached_latents",  # NEW: Cache directory
-    student_model_name: str = "vit_base_patch16_224",  # NEW: Student model size (vit_tiny, vit_small, vit_base)
+    masking_strategy: str = "multiblock",  # NEW: "random" or "multiblock"
+    use_cached_latents: bool = False,
+    cache_dir: str | Path = "/mnt/ssv2/cached_latents",
+    student_model_name: str = "vit_base_patch16_224",
+    grad_clip: float = 0.02,  # PAPER: Tight clipping (was 1.0)
+    # Optimizer betas (paper: β₂=0.95 for stability)
+    betas: tuple[float, float] = (0.9, 0.95),
+    # Predictor config
+    predictor_dim: int = 384,
+    predictor_depth: int = 6,
+    predictor_num_heads: int = 6,  # Must divide predictor_dim evenly
+    # THROUGHPUT options
+    grad_checkpointing: bool = True,  # Disable for +50-100% speed (uses more VRAM)
+    cudnn_benchmark: bool = False,  # Enable for +5-15% speed (less deterministic)
+    # Training stability options
+    grad_accum_steps: int = 1,  # Gradient accumulation steps (virtual batch size)
+    variance_loss_weight: float = 0.0,  # VICReg-style variance penalty weight
+    variance_target: float = 1.0,  # Target stddev for variance penalty
+    use_dataloader_masks: bool = True,  # Use multi-block masks from dataloader
+    tubelet_size: int = 2,
+    patch_size: int = 16,
 ) -> None:
     # CRITICAL: Monitor system memory to prevent PC freezes
     mem = psutil.virtual_memory()
@@ -69,6 +95,9 @@ def train(
     tempfile.tempdir = TORCH_TMP_DIR
     print(f"[startup] temp_dir={TORCH_TMP_DIR}")
 
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1")
+
     torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,21 +108,47 @@ def train(
         # Limit PyTorch to 90% of GPU memory to prevent OOM crashes
         torch.cuda.set_per_process_memory_fraction(0.9, device=0)
         # Enable memory-efficient features
-        torch.backends.cudnn.benchmark = False  # More stable, slightly slower
+        torch.backends.cudnn.benchmark = cudnn_benchmark  # Configurable for speed vs stability
         torch.backends.cuda.matmul.allow_tf32 = True
         print(f"[startup] GPU: {torch.cuda.get_device_name(device)} ({torch.cuda.get_device_properties(device).total_memory / (1024**3):.2f}GB)")
         print(f"[startup] GPU memory limit set to 90% to prevent crashes")
     
     # Dataset loading - toggle between cached and non-cached modes
     if use_cached_latents:
-        from src.data.cached_loader import HybridSSv2Dataset, collate_hybrid
-        print(f"[startup] Using CACHED latents mode from {cache_dir}")
-        dataset = HybridSSv2Dataset(data_root=data_root, cache_dir=cache_dir, split=split)
-        collate_fn = collate_hybrid
+        if use_dataloader_masks:
+            from src.data.cached_loader import HybridSSv2MaskedDataset, collate_hybrid_with_masks
+            print(f"[startup] Using CACHED latents + DATALOADER masks from {cache_dir}")
+            dataset = HybridSSv2MaskedDataset(
+                data_root=data_root,
+                cache_dir=cache_dir,
+                split=split,
+                mask_ratio=mask_ratio,
+                masking_strategy=masking_strategy,
+                tubelet_size=tubelet_size,
+                patch_size=patch_size,
+            )
+            collate_fn = collate_hybrid_with_masks
+        else:
+            from src.data.cached_loader import HybridSSv2Dataset, collate_hybrid
+            print(f"[startup] Using CACHED latents mode from {cache_dir}")
+            dataset = HybridSSv2Dataset(data_root=data_root, cache_dir=cache_dir, split=split)
+            collate_fn = collate_hybrid
     else:
-        print(f"[startup] Using NON-CACHED mode (teacher computed on-the-fly)")
-        dataset = SSv2Dataset(data_root, split=split)
-        collate_fn = collate_drop_none
+        if use_dataloader_masks:
+            print("[startup] Using NON-CACHED mode with DATALOADER masks")
+            dataset = SSv2MaskedDataset(
+                data_root,
+                split=split,
+                mask_ratio=mask_ratio,
+                masking_strategy=masking_strategy,
+                tubelet_size=tubelet_size,
+                patch_size=patch_size,
+            )
+            collate_fn = collate_drop_none_with_masks
+        else:
+            print(f"[startup] Using NON-CACHED mode (teacher computed on-the-fly)")
+            dataset = SSv2Dataset(data_root, split=split)
+            collate_fn = collate_drop_none
     
     loader_kwargs = {}
     if num_workers > 0:
@@ -133,6 +188,16 @@ def train(
         print(f"[startup] Teacher model will NOT be loaded (using pre-cached latents)")
     else:
         print(f"[startup] NON-CACHED MODE: Teacher model will be loaded and run every step")
+    if use_dataloader_masks:
+        print(f"[startup] DATALOADER MASKS: strategy={masking_strategy} ratio={mask_ratio}")
+    if grad_accum_steps > 1:
+        effective_batch_size = batch_size * grad_accum_steps
+        print(f"[startup] grad_accum_steps={grad_accum_steps} effective_batch_size={effective_batch_size}")
+    if variance_loss_weight > 0:
+        print(
+            "[startup] variance_loss_weight="
+            f"{variance_loss_weight} variance_target={variance_target}"
+        )
     print(
         "[startup] torch="
         f"{torch.__version__} cuda={torch.version.cuda} cudnn={torch.backends.cudnn.version()}"
@@ -140,33 +205,54 @@ def train(
 
     model = SALTModel(
         mask_ratio=mask_ratio,
+        masking_strategy=masking_strategy,  # NEW
         dtype=model_dtype,
         student_model_name=student_model_name,
+        tubelet_size=tubelet_size,
+        patch_size=patch_size,
+        predictor_dim=predictor_dim,  # NEW
+        predictor_depth=predictor_depth,  # NEW
+        predictor_num_heads=predictor_num_heads,  # NEW
     )
-    model.student.set_grad_checkpointing(True)
+    model.student.set_grad_checkpointing(grad_checkpointing)
     model.to(device=device, dtype=model_dtype)
     if device.type == "cuda":
         model = torch.compile(model, mode="max-autotune")
 
+    # Optimizer with paper-aligned betas
     try:
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=lr,
-            weight_decay=weight_decay,
+            betas=betas,  # PAPER: (0.9, 0.95)
+            weight_decay=weight_decay_start,  # Initial value, will be scheduled
             fused=device.type == "cuda",
         )
     except TypeError:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    mse_loss = nn.MSELoss(reduction="none")
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay_start
+        )
 
-    total_steps = max_steps or (len(dataloader) * epochs)
+    total_steps = max_steps or math.ceil((len(dataloader) * epochs) / grad_accum_steps)
+    min_lr_ratio = min_lr / lr
+    
+    # Weight decay schedule (paper: cosine from 0.04 → 0.4)
+    def get_weight_decay(step: int) -> float:
+        progress = step / max(1, total_steps)
+        # Cosine schedule: starts at weight_decay_start, ends at weight_decay_end
+        return weight_decay_start + (weight_decay_end - weight_decay_start) * 0.5 * (1 - math.cos(progress * math.pi))
+    
     def lr_lambda(step: int) -> float:
         warmup_scale = min((step + 1) / max(1, warmup_steps), 1.0)
         progress = step / max(1, total_steps)
-        cosine_scale = 0.5 * (1.0 + math.cos(progress * math.pi))
+        # Cosine decay with minimum LR floor
+        cosine_scale = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(progress * math.pi))
         return warmup_scale * cosine_scale
 
     lr_schedule = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    print(f"[startup] masking_strategy={masking_strategy} grad_clip={grad_clip}")
+    print(f"[startup] betas={betas} weight_decay={weight_decay_start}→{weight_decay_end}")
 
     _setup_wandb(project="salt-vla", run_name="salt-training")
 
@@ -179,9 +265,120 @@ def train(
     last_memory_check = time.time()
     
     dataloader_iter = iter(dataloader)
+
+    def variance_loss(predictions: torch.Tensor, target_std: float) -> torch.Tensor:
+        pred_flat = predictions.reshape(-1, predictions.shape[-1])
+        if pred_flat.numel() == 0:
+            return pred_flat.sum()
+        std = pred_flat.float().std(dim=0)
+        return torch.relu(target_std - std).mean()
+
+    accum_steps = 0
+    accum_loss = 0.0
+    accum_mse_loss = 0.0
+    accum_var_loss = 0.0
+    last_clips_per_sec = 0.0
+    last_decode_time = 0.0
+    last_gpu_mem_gb = 0.0
+    last_gpu_mem_max_gb = 0.0
+
+    def apply_optimizer_step() -> bool:
+        nonlocal step
+        nonlocal accum_steps, accum_loss, accum_mse_loss, accum_var_loss
+        nonlocal last_step_time, last_clips_per_sec, last_decode_time
+        nonlocal last_gpu_mem_gb, last_gpu_mem_max_gb
+
+        if accum_steps == 0:
+            return False
+
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        lr_schedule.step()
+
+        current_wd = get_weight_decay(step)
+        for param_group in optimizer.param_groups:
+            param_group['weight_decay'] = current_wd
+
+        avg_loss = accum_loss / accum_steps
+        avg_mse_loss = accum_mse_loss / accum_steps
+        avg_var_loss = (
+            accum_var_loss / accum_steps if variance_loss_weight > 0 else 0.0
+        )
+
+        accum_steps = 0
+        accum_loss = 0.0
+        accum_mse_loss = 0.0
+        accum_var_loss = 0.0
+
+        current_time = time.time()
+        step_duration = current_time - last_step_time
+        last_step_time = current_time
+        if step_duration > 300.0 and step > 0:
+            print(f"[WARNING] Step {step} took {step_duration:.1f}s (possible stall detected)")
+
+        if step % log_interval == 0:
+            import wandb
+
+            mem = psutil.virtual_memory()
+            system_ram_percent = mem.percent
+            system_ram_available_gb = mem.available / (1024**3)
+
+            wandb_payload = {
+                "loss": avg_loss,
+                "mse_loss": avg_mse_loss,
+                "lr": optimizer.param_groups[0]["lr"],
+                "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                "clips_per_sec": last_clips_per_sec,
+                "batch_decode_sec": last_decode_time,
+                "gpu_mem_gb": last_gpu_mem_gb,
+                "gpu_mem_max_gb": last_gpu_mem_max_gb,
+                "system_ram_percent": system_ram_percent,
+                "system_ram_available_gb": system_ram_available_gb,
+            }
+            if variance_loss_weight > 0:
+                wandb_payload["variance_loss"] = avg_var_loss
+
+            wandb.log(wandb_payload, step=step)
+            print(
+                "[train] step="
+                f"{step} loss={avg_loss:.4f} clips/s={last_clips_per_sec:.2f} "
+                f"decode_s={last_decode_time:.3f} gpu_mem_gb={last_gpu_mem_gb:.2f} "
+                f"ram={system_ram_percent:.1f}%"
+            )
+
+        step += 1
+        if max_steps and step >= max_steps:
+            return True
+        return False
+    expected_patches = (16 // tubelet_size) * (224 // patch_size) * (224 // patch_size)
+    expected_masked = int(expected_patches * mask_ratio)
+    expected_visible = expected_patches - expected_masked
+
     try:
         preflight_batch = next(dataloader_iter)
-        if use_cached_latents:
+        if use_cached_latents and use_dataloader_masks:
+            if (
+                preflight_batch is None
+                or (isinstance(preflight_batch, tuple) and preflight_batch[0].numel() == 0)
+            ):
+                print("[preflight] Warning: empty batch from loader on first fetch.")
+            else:
+                videos, latents, visible_idx, masked_idx = preflight_batch
+                if videos.shape[1:] != (3, 16, 224, 224):
+                    raise ValueError("[preflight] Expected video shape (B, 3, 16, 224, 224).")
+                if latents.ndim != 3 or latents.shape[1:] != (1568, 768):
+                    raise ValueError(f"[preflight] Expected latent shape (B, 1568, 768), got {latents.shape}.")
+                if visible_idx.shape[1] != expected_visible or masked_idx.shape[1] != expected_masked:
+                    raise ValueError("[preflight] Mask indices shape mismatch for expected patch count.")
+                print(
+                    "[preflight] first batch: videos="
+                    f"{tuple(videos.shape)}, latents={tuple(latents.shape)}, "
+                    f"visible={tuple(visible_idx.shape)}, masked={tuple(masked_idx.shape)}"
+                )
+        elif use_cached_latents:
             # Cached mode: batch is (videos, latents) tuple
             if preflight_batch is None or (isinstance(preflight_batch, tuple) and (preflight_batch[0].numel() == 0 or preflight_batch[1].numel() == 0)):
                 print("[preflight] Warning: empty batch from loader on first fetch.")
@@ -192,6 +389,24 @@ def train(
                 if latents.ndim != 3 or latents.shape[1:] != (1568, 768):
                     raise ValueError(f"[preflight] Expected latent shape (B, 1568, 768), got {latents.shape}.")
                 print(f"[preflight] first batch: videos={tuple(videos.shape)}, latents={tuple(latents.shape)}")
+        elif use_dataloader_masks:
+            # Non-cached mode with dataloader masks
+            if (
+                preflight_batch is None
+                or (isinstance(preflight_batch, tuple) and preflight_batch[0].numel() == 0)
+            ):
+                print("[preflight] Warning: empty batch from loader on first fetch.")
+            else:
+                videos, visible_idx, masked_idx = preflight_batch
+                if videos.shape[1:] != (3, 16, 224, 224):
+                    raise ValueError("[preflight] Expected video shape (B, 3, 16, 224, 224).")
+                if visible_idx.shape[1] != expected_visible or masked_idx.shape[1] != expected_masked:
+                    raise ValueError("[preflight] Mask indices shape mismatch for expected patch count.")
+                print(
+                    "[preflight] first batch: videos="
+                    f"{tuple(videos.shape)}, visible={tuple(visible_idx.shape)}, "
+                    f"masked={tuple(masked_idx.shape)}"
+                )
         else:
             # Non-cached mode: batch is just videos
             if preflight_batch is None or preflight_batch.numel() == 0:
@@ -240,13 +455,39 @@ def train(
                 continue
 
             # Handle cached vs non-cached modes
-            if use_cached_latents:
+            visible_idx = None
+            masked_idx = None
+            if use_cached_latents and use_dataloader_masks:
+                if (
+                    batch is None
+                    or (isinstance(batch, tuple) and (batch[0].numel() == 0 or batch[1].numel() == 0))
+                ):
+                    continue
+                videos, cached_teacher_latents, visible_idx, masked_idx = batch
+                if visible_idx.numel() == 0 or masked_idx.numel() == 0:
+                    continue
+                videos = videos.to(device=device, dtype=model_dtype, non_blocking=True)
+                cached_teacher_latents = cached_teacher_latents.to(
+                    device=device, dtype=model_dtype, non_blocking=True
+                )
+                visible_idx = visible_idx.to(device=device, non_blocking=True)
+                masked_idx = masked_idx.to(device=device, non_blocking=True)
+            elif use_cached_latents:
                 # Cached mode: batch is (videos, cached_latents) tuple
                 if batch is None or (isinstance(batch, tuple) and (batch[0].numel() == 0 or batch[1].numel() == 0)):
                     continue
                 videos, cached_teacher_latents = batch
                 videos = videos.to(device=device, dtype=model_dtype, non_blocking=True)
                 cached_teacher_latents = cached_teacher_latents.to(device=device, dtype=model_dtype, non_blocking=True)
+            elif use_dataloader_masks:
+                if batch is None or (isinstance(batch, tuple) and batch[0].numel() == 0):
+                    continue
+                videos, visible_idx, masked_idx = batch
+                if visible_idx.numel() == 0 or masked_idx.numel() == 0:
+                    continue
+                videos = videos.to(device=device, dtype=model_dtype, non_blocking=True)
+                visible_idx = visible_idx.to(device=device, non_blocking=True)
+                masked_idx = masked_idx.to(device=device, non_blocking=True)
             else:
                 # Non-cached mode: batch is just videos
                 if batch is None:
@@ -265,81 +506,57 @@ def train(
                 else nullcontext()
             )
             with autocast_ctx:
+                # V-JEPA forward: returns (pred_masked, teacher_masked)
+                # Both tensors have shape (B, N_masked, D_teacher)
                 if use_cached_latents:
-                    # Cached mode: mask video, run student, use cached teacher latents
-                    masked_video, mask_tokens = model._mask_video(videos)
-                    student_tokens = model.student(masked_video)
-                    student_pred = model.proj(student_tokens)
-                    teacher_latents = cached_teacher_latents
+                    if use_dataloader_masks:
+                        pred_masked, teacher_masked = model(
+                            videos,
+                            cached_teacher_latents,
+                            visible_idx=visible_idx,
+                            masked_idx=masked_idx,
+                        )
+                    else:
+                        pred_masked, teacher_masked = model(videos, cached_teacher_latents)
                 else:
-                    # Non-cached mode: original flow (computes teacher latents)
-                    student_pred, teacher_latents, mask_tokens = model(videos)
+                    if use_dataloader_masks:
+                        pred_masked, teacher_masked = model(
+                            videos, visible_idx=visible_idx, masked_idx=masked_idx
+                        )
+                    else:
+                        pred_masked, teacher_masked = model(videos)
                 
-                # Alignment (same for both modes)
-                if teacher_latents.shape[1] == student_pred.shape[1] - 1:
-                    student_pred = student_pred[:, 1:]
-                    mask_tokens = mask_tokens[:, 1:]
-                
-                if mask_tokens.shape[1] != student_pred.shape[1]:
-                    raise ValueError(
-                        f"Mask tokens mismatch: mask={mask_tokens.shape[1]} preds={student_pred.shape[1]}"
-                    )
-                mask_tokens = mask_tokens.unsqueeze(-1).to(dtype=student_pred.dtype)
-                loss_map = mse_loss(student_pred, teacher_latents)
-                loss = (loss_map * mask_tokens).sum() / (mask_tokens.sum() * loss_map.shape[-1] + 1e-6)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            lr_schedule.step()
-
-            clips_per_sec = videos.shape[0] / max(time.time() - start_time, 1e-6)
-            
-            # Watchdog: update step time
-            current_time = time.time()
-            step_duration = current_time - last_step_time
-            last_step_time = current_time
-            
-            # Warn if step took too long (possible hang/stall)
-            if step_duration > 300.0 and step > 0:  # 5 minutes
-                print(f"[WARNING] Step {step} took {step_duration:.1f}s (possible stall detected)")
-
-            if step % log_interval == 0:
-                import wandb
-
-                if device.type == "cuda":
-                    gpu_mem_gb = torch.cuda.memory_allocated() / (1024**3)
-                    gpu_mem_max_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                # Simple MSE loss - no masking needed (only masked positions returned)
+                mse_loss = nn.functional.mse_loss(pred_masked, teacher_masked)
+                if variance_loss_weight > 0:
+                    var_loss = variance_loss(pred_masked, variance_target)
                 else:
-                    gpu_mem_gb = 0.0
-                    gpu_mem_max_gb = 0.0
+                    var_loss = pred_masked.new_tensor(0.0)
+                loss = mse_loss + variance_loss_weight * var_loss
                 
-                # Track system RAM for early leak detection
-                mem = psutil.virtual_memory()
-                system_ram_percent = mem.percent
-                system_ram_available_gb = mem.available / (1024**3)
+            accum_loss += loss.item()
+            accum_mse_loss += mse_loss.item()
+            if variance_loss_weight > 0:
+                accum_var_loss += var_loss.item()
+            accum_steps += 1
 
-                wandb.log(
-                    {
-                        "loss": loss.item(),
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "clips_per_sec": clips_per_sec,
-                        "batch_decode_sec": decode_time,
-                        "gpu_mem_gb": gpu_mem_gb,
-                        "gpu_mem_max_gb": gpu_mem_max_gb,
-                        "system_ram_percent": system_ram_percent,
-                        "system_ram_available_gb": system_ram_available_gb,
-                    },
-                    step=step,
-                )
-                print(
-                    "[train] step="
-                    f"{step} loss={loss.item():.4f} clips/s={clips_per_sec:.2f} "
-                    f"decode_s={decode_time:.3f} gpu_mem_gb={gpu_mem_gb:.2f} "
-                    f"ram={system_ram_percent:.1f}%"
-                )
+            (loss / grad_accum_steps).backward()
 
-            step += 1
-            if max_steps and step >= max_steps:
+            last_clips_per_sec = videos.shape[0] / max(time.time() - start_time, 1e-6)
+            last_decode_time = decode_time
+            if device.type == "cuda":
+                last_gpu_mem_gb = torch.cuda.memory_allocated() / (1024**3)
+                last_gpu_mem_max_gb = torch.cuda.max_memory_allocated() / (1024**3)
+            else:
+                last_gpu_mem_gb = 0.0
+                last_gpu_mem_max_gb = 0.0
+
+            if accum_steps >= grad_accum_steps:
+                if apply_optimizer_step():
+                    return
+
+        if accum_steps > 0:
+            if apply_optimizer_step():
                 return
 
 

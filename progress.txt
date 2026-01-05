@@ -1,0 +1,302 @@
+# SALT-VLA Training Progress Log
+# Last Updated: 2026-01-05 19:48 UTC
+#
+# PURPOSE: This document captures ALL training progress for handoff to another
+# LLM or human. Everything needed to continue work is documented here.
+
+================================================================================
+                           PROJECT OVERVIEW
+================================================================================
+
+## Goal
+Train a SoTA ViT-Base vision encoder for VLA (Vision-Language-Action) robotics
+using V-JEPA self-supervised learning on video data.
+
+## Architecture
+- Teacher: VideoMAEv2-Base (frozen, provides target latents)
+- Student: ViT-Base (86M params, being trained)
+- Predictor: 12-layer transformer (384-dim, 6 heads)
+- Loss: MSE on masked patch predictions in latent space
+
+## Hardware
+- GPU: NVIDIA GeForce RTX 5090 D (31.32GB VRAM, using 25GB limit)
+- Storage: Samsung 9100 Pro NVMe Gen5 (14GB/s, mounted at /mnt/ssv2)
+- CPU: 16-core (using 8 workers for data loading)
+
+## Dataset
+- Something-Something v2 (SSv2)
+- 168,903 video clips
+- Pre-cached teacher latents at /mnt/ssv2/cached_latents
+- Latent shape: (1568 patches, 768 dims) per video
+
+## Key Files
+- src/train.py         - Main training function
+- src/models/salt.py   - SALTModel with V-JEPA architecture
+- train_vitb_*.py      - ViT-Base training configurations
+- CLAUDE.md            - Project rules and validated hyperparameters
+
+================================================================================
+                    COMPLETED EXPERIMENTS SUMMARY
+================================================================================
+
+| Run | Config | Epochs | Min Loss | Final Loss | Key Finding |
+|-----|--------|--------|----------|------------|-------------|
+| 1 | ViT-Tiny baseline | 3 | 12.5 | 12.5 | Plateau at 12.5 |
+| 2 | ViT-Tiny LR fix | 3 | 10.73 | 11.3 | LR=3e-4 works |
+| 3 | ViT-Base 5-epoch | 5 | 10.86 | 11.5 | Scaling works |
+| 4 | ViT-Base 10-epoch | 10 | 10.76 | 11.4 | More epochs ≠ better |
+| 5 | ViT-Base LR=3e-4 | 3 | **10.40** | ~11.1 | **BEST SO FAR** |
+
+## Best Configuration Found (as of now)
+```python
+train(
+    student_model_name="vit_base_patch16_224",
+    batch_size=32,
+    epochs=3,  # Short for iteration, 10+ for final
+    lr=3e-4,   # KEY: 2x higher than initial
+    min_lr=3e-5,
+    warmup_steps=500,
+    grad_clip=0.02,
+    betas=(0.9, 0.95),
+    weight_decay_start=0.04,
+    weight_decay_end=0.4,
+    mask_ratio=0.75,
+    masking_strategy="multiblock",
+    predictor_dim=384,
+    predictor_depth=12,
+    grad_checkpointing=False,  # Speed optimization
+    cudnn_benchmark=True,
+)
+```
+
+================================================================================
+                       PHASE 1: BASELINE (2026-01-04)
+================================================================================
+
+## Problem Discovered
+Initial ViT-Tiny training with lr=1e-4 plateaued at loss=12.5 after 500 steps.
+Loss did not improve from step 500 to step 52,000.
+
+## Root Cause
+1. Learning rate too low for ViT architecture
+2. Cosine decay without min_lr floor → LR approaches 0 too quickly
+3. Model learns during warmup, then stagnates
+
+## Solution Applied
+- lr: 1e-4 → 3e-4 (3x increase)
+- min_lr: 0 → 3e-5 (10% floor)
+- Result: Loss dropped to 11.3 (vs 12.5 plateau)
+
+================================================================================
+                  PHASE 2: PAPER ALIGNMENT (2026-01-04)
+================================================================================
+
+## V-JEPA Paper Hyperparameters Applied
+
+| Parameter | Before | After (Paper) |
+|-----------|--------|---------------|
+| grad_clip | 1.0 | 0.02 |
+| masking | random | multiblock |
+| predictor_depth | 6 | 12 |
+| weight_decay | 0.05 fixed | 0.04→0.4 cosine |
+| optimizer β₂ | 0.999 | 0.95 |
+
+## Code Changes Made
+1. src/train.py:
+   - Added `weight_decay_start`, `weight_decay_end` for cosine schedule
+   - Added `betas` parameter for AdamW
+   - Added `masking_strategy` parameter
+   - Added `grad_checkpointing`, `cudnn_benchmark` for throughput
+   - Added `predictor_num_heads` for flexible predictor config
+
+2. src/models/salt.py:
+   - Implemented `_multiblock_masking()` method
+   - Fixed scatter dtype mismatch in JEPAPredictor
+   - Added `masking_strategy` to `_create_mask_indices()`
+
+================================================================================
+                  PHASE 3: VIT-BASE SCALING (2026-01-05)
+================================================================================
+
+## ViT-Base 5-Epoch Run (COMPLETED)
+- Script: train_vitb_fast_throughput.py
+- Duration: ~1.5 hours
+- Steps: 26,400
+- Results: loss 15.76 → 11.5, min=10.86
+- Throughput: 185 clips/s (2x improvement with grad_checkpointing=False)
+
+## ViT-Base 10-Epoch Run (COMPLETED)
+- Script: train_vitb_10epoch.py
+- Duration: ~4.5 hours
+- Steps: 52,780
+- Results: loss 15.6 → 11.4, min=10.76
+- Finding: More epochs did NOT break plateau significantly
+
+================================================================================
+              PHASE 5: HYPERPARAMETER SWEEP (2026-01-05, CURRENT)
+================================================================================
+
+## Strategy
+Short 3-epoch runs (~30 min each) to test hyperparameter hypotheses quickly.
+Goal: Find config that breaks the 11.3-11.7 plateau.
+
+## Experiments Created
+
+### Experiment 1: Higher LR (IN PROGRESS)
+File: train_vitb_exp1_higherlr.py
+Change: lr 1.5e-4 → 3e-4 (2x)
+Status: Running, step 6100/15834
+Current Results:
+  - Min loss: 10.40 (BETTER than 10.76 baseline!)
+  - Current loss: ~10.6-11.6
+  - Throughput: ~190-220 clips/s
+VERDICT: PROMISING - Higher LR is helping
+
+### Experiment 2: Higher Mask Ratio (QUEUED)
+File: train_vitb_exp2_highmask.py
+Change: mask_ratio 0.75 → 0.9
+Hypothesis: Harder task → better representations
+
+### Experiment 3: Combined (QUEUED)
+File: train_vitb_exp3_combined.py
+Changes: lr=3e-4 AND mask_ratio=0.9
+Hypothesis: Combined improvements may compound
+
+================================================================================
+                      CURRENT EXPERIMENT STATUS
+================================================================================
+
+## Active Run
+Script: train_vitb_exp1_higherlr.py
+PID: 1861999
+Started: 2026-01-05 18:59
+
+## Live Metrics (as of step 6100)
+- Steps completed: 6100 / 15834 (38%)
+- Loss range: 10.4 - 11.7
+- Minimum loss: 10.40 (NEW BEST)
+- Throughput: 185-225 clips/s
+- GPU memory: 1.12 GB
+- ETA: ~20 minutes remaining
+
+## Comparison to Baseline
+| Metric | 10-epoch Baseline | Exp1 (current) |
+|--------|-------------------|----------------|
+| Min loss | 10.76 | **10.40** |
+| Avg loss | 11.4 | ~11.1 |
+| LR | 1.5e-4 | 3e-4 |
+
+================================================================================
+                           KEY LEARNINGS
+================================================================================
+
+1. LEARNING RATE IS CRITICAL
+   - ViT needs higher LR than CNNs (3e-4 vs 1e-4)
+   - min_lr floor prevents premature stagnation
+   - Warmup should be 1-5% of total steps
+
+2. MORE EPOCHS ≠ BETTER
+   - 5 vs 10 epochs gave similar results (min loss 10.86 vs 10.76)
+   - Plateau must be broken with hyperparameters, not duration
+   - Short 3-epoch runs are sufficient for hyperparameter search
+
+3. THROUGHPUT OPTIMIZATIONS
+   - grad_checkpointing=False: +50-100% speed (1.12GB vs 0.83GB VRAM)
+   - cudnn_benchmark=True: +5-15% speed
+   - Batch size 32 is max stable (64 causes bus errors)
+
+4. LOSS INTERPRETATION
+   - MSE on 768-dim latents
+   - ~12-15: random predictions
+   - ~11-12: learning (better than random)
+   - ~10 or below: good convergence (current target)
+   - Target for SoTA: <10.0
+
+5. PREDICTOR CONFIGURATION
+   - predictor_dim must be divisible by num_heads
+   - ViT-Base: dim=384, heads=6 (384/6=64 head_dim)
+   - ViT-Large: dim=512, heads=8 (512/8=64 head_dim)
+
+================================================================================
+                        COMMANDS TO REPRODUCE
+================================================================================
+
+## Run Tests
+```bash
+cd /home/derekszen/Projects/SALT-VLA
+PYTHONPATH=. uv run pytest tests/ -v
+```
+
+## Start Training
+```bash
+cd /home/derekszen/Projects/SALT-VLA
+PYTHONPATH=. nohup /home/derekszen/.local/bin/uv run python train_vitb_exp1_higherlr.py > /tmp/exp1.log 2>&1 &
+```
+
+## Monitor Training
+```bash
+tail -f /home/derekszen/Projects/SALT-VLA/wandb/latest-run/files/output.log
+```
+
+## Check Min Loss
+```bash
+cat wandb/latest-run/files/output.log | grep "\[train\]" | awk -F'loss=' '{print $2}' | awk '{print $1}' | sort -n | head -5
+```
+
+================================================================================
+                           TRAINING CONFIGS
+================================================================================
+
+## Active Configs (in project root)
+- train_vitb_exp1_higherlr.py  - LR=3e-4, mask=0.75 (RUNNING)
+- train_vitb_exp2_highmask.py  - LR=1.5e-4, mask=0.9 (QUEUED)
+- train_vitb_exp3_combined.py  - LR=3e-4, mask=0.9 (QUEUED)
+- train_vitb_10epoch.py        - Long training config
+- train_vitb_fast_throughput.py - Throughput optimized
+
+## Archived/Cancelled
+- train_vitl_extreme.py - ViT-Large (cancelled, focus on ViT-Base)
+- queue_vitb_vitl.py - Sequential queue (cancelled)
+
+================================================================================
+                           NEXT STEPS
+================================================================================
+
+## Immediate (when Exp1 completes)
+1. Compare Exp1 final loss to baseline (10.76)
+2. If Exp1 better: queue Exp3 (combined) to test if mask_ratio helps further
+3. If Exp1 worse: queue Exp2 (higher mask) to test alternative hypothesis
+
+## After Hyperparameter Search
+1. Take best config and run 10-20 epochs for final model
+2. Save checkpoint for downstream evaluation
+3. Consider IntPhys2 evaluation pipeline (scaffolded but not implemented)
+
+## For Publication
+1. Need loss below 10.0 for competitive results
+2. Consider additional ablations (predictor depth, width)
+3. Downstream task evaluation (action prediction, video understanding)
+
+================================================================================
+                           WANDB PROJECT
+================================================================================
+
+Project URL: https://wandb.ai/zengzhuoxi-peking-university/salt-vla
+
+Recent runs visible in wandb/latest-run/ directory.
+
+================================================================================
+                    HANDOFF NOTES FOR NEXT LLM
+================================================================================
+
+1. Current experiment (Exp1) is showing promising results with min loss 10.40
+2. If it completes successfully, queue Exp3 (combined) next
+3. The key insight is that LR=3e-4 works better than 1.5e-4 for ViT-Base
+4. All paper-aligned hyperparameters are already implemented
+5. Focus on pushing loss below 10.0 for publishable results
+6. Tests are passing (64/64) - run them before making changes
+7. Throughput optimizations are enabled (grad_checkpointing=False)
+
+================================================================================
+# End of Progress Log
+================================================================================

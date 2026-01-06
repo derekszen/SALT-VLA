@@ -37,7 +37,7 @@ train_loader = DataLoader(..., multiprocessing_context=mp.get_context(mp_context
 ```
 
 ### 2. Model Layer (`src/models/salt.py`)
-- **Teacher:** `MCG-NJU/videomae-huge`. Frozen, `eval()`.
+- **Teacher:** `Tianjiao-Yu/videomae-huge`. Frozen, `eval()`.
 - **Student:** `timm` ViT-B. `Conv3d` (2, 16, 16) adapter.
 - **Inflation:** 1568 positional tokens (8 temporal x 196 spatial).
 

@@ -1,13 +1,13 @@
 # Latent Caching System
 
-**Status:** ✅ Caching in progress (see background task b94e04b)
+**Status:** ✅ Recache required after teacher change (VideoMAE v1-Huge)
 **Expected time:** ~25 minutes for full training set (168K videos)
 
 ---
 
 ## 🎯 What is Latent Caching?
 
-Instead of running the frozen VideoMAEv2 teacher model during training (which takes time but provides no learning), we **pre-compute all teacher latents once** and save them to disk.
+Instead of running the frozen VideoMAE v1-Huge teacher model during training (which takes time but provides no learning), we **pre-compute all teacher latents once** and save them to disk.
 
 ### Benefits:
 - **30-50% faster training** per epoch
@@ -29,29 +29,21 @@ PYTHONPATH=. uv run python cache_teacher_latents.py --split train
 ```
 
 This script:
-- Loads VideoMAEv2 teacher model
+- Loads VideoMAE v1-Huge teacher model
 - Iterates through all videos
 - Computes teacher latents for each: `(N_tokens, hidden_dim)`
-- Saves to `/mnt/ssv2/cached_latents/train/{video_id}.pt`
+- Saves to `/mnt/ssv2/cached_latents_v1huge/train/{video_id}.pt`
 
 ### 2. Training Phase (Fast!)
-Use `CachedSSv2Dataset` instead of `SSv2Dataset`:
+Use cached latents with dataloader masks (multi-block cubes):
 
 ```python
-from src.data.cached_loader import CachedSSv2Dataset, collate_cached_latents
+from src.train import train
 
-# Instead of:
-# dataset = SSv2Dataset(data_root, split="train")
-
-# Use:
-dataset = CachedSSv2Dataset(cache_dir="/mnt/ssv2/cached_latents", split="train")
-
-# And change collate function:
-dataloader = DataLoader(
-    dataset,
-    batch_size=16,
-    collate_fn=collate_cached_latents,  # Instead of collate_drop_none
-    ...
+train(
+    use_cached_latents=True,
+    use_dataloader_masks=True,
+    cache_dir="/mnt/ssv2/cached_latents_v1huge",
 )
 ```
 
@@ -59,24 +51,31 @@ dataloader = DataLoader(
 
 ## 🚀 Usage
 
+## ✅ Cached Training Status
+
+- Cached latents mode is implemented in `src/train.py` with `use_cached_latents=True`.
+- Dataloader masks (`use_dataloader_masks=True`) supply multi-block indices to the model.
+- Quick validation: 50-step cached/non-cached smoke tests passed; cached mode is ~5% faster and skips teacher load.
+- Recommended cache root for VideoMAE v1-Huge: `/mnt/ssv2/cached_latents_v1huge`.
+
 ### Step 1: Cache Latents (In Progress)
 
 ```bash
-# For training set (currently running):
-PYTHONPATH=. uv run python cache_teacher_latents.py --split train
+# For training set:
+PYTHONPATH=. uv run python cache_teacher_latents.py --split train --cache_dir /mnt/ssv2/cached_latents_v1huge
 
-# For validation set (run this next):
-PYTHONPATH=. uv run python cache_teacher_latents.py --split validation
+# For validation set:
+PYTHONPATH=. uv run python cache_teacher_latents.py --split validation --cache_dir /mnt/ssv2/cached_latents_v1huge
 
 # For test set:
-PYTHONPATH=. uv run python cache_teacher_latents.py --split test
+PYTHONPATH=. uv run python cache_teacher_latents.py --split test --cache_dir /mnt/ssv2/cached_latents_v1huge
 ```
 
 **Options:**
 ```bash
 --data_root /mnt/ssv2          # Dataset location
 --split train                  # Which split to cache
---cache_dir /mnt/ssv2/cached_latents  # Where to save
+--cache_dir /mnt/ssv2/cached_latents_v1huge  # Where to save
 --batch_size 32                # Larger is faster (no backprop!)
 --num_workers 8                # Parallel data loading
 --device 0                     # Which GPU to use
@@ -85,7 +84,7 @@ PYTHONPATH=. uv run python cache_teacher_latents.py --split test
 ### Step 2: Verify Cache
 
 ```bash
-ls /mnt/ssv2/cached_latents/train/
+ls /mnt/ssv2/cached_latents_v1huge/train/
 # Should see:
 #   metadata.json    # Cache info
 #   123.pt           # Latent for video ID 123
@@ -95,51 +94,13 @@ ls /mnt/ssv2/cached_latents/train/
 
 ### Step 3: Use Cached Latents in Training
 
-You'll need to modify `src/train.py` to use cached latents. See section below.
+`src/train.py` already supports cached latents and dataloader masks. Use:
 
----
+```python
+train(use_cached_latents=True, use_dataloader_masks=True, cache_dir="/mnt/ssv2/cached_latents_v1huge")
+```
 
-## 🔧 Modifying Training Code
-
-Currently, `src/train.py` uses `SSv2Dataset` which loads videos. To use cached latents, you need:
-
-### Changes Required:
-
-1. **Import cached loader:**
-   ```python
-   from src.data.cached_loader import CachedSSv2Dataset, collate_cached_latents
-   ```
-
-2. **Use cached dataset:**
-   ```python
-   # OLD:
-   dataset = SSv2Dataset(data_root, split=split)
-
-   # NEW:
-   dataset = CachedSSv2Dataset(cache_dir="/mnt/ssv2/cached_latents", split=split)
-   ```
-
-3. **Change collate function:**
-   ```python
-   dataloader = DataLoader(
-       dataset,
-       ...,
-       collate_fn=collate_cached_latents,  # Instead of collate_drop_none
-   )
-   ```
-
-4. **Modify training loop:**
-   Since cached latents are already teacher outputs, you don't need the teacher forward pass:
-   ```python
-   # OLD:
-   student_pred, teacher_latents, mask = model(batch)  # batch is video
-
-   # NEW:
-   teacher_latents = batch.to(device, dtype=model_dtype)  # batch is already latents!
-   # You'll need to:
-   # 1. Load videos separately for student input (or cache masked videos too)
-   # 2. Generate mask deterministically (same random seed per video)
-   ```
+Multi-block masks are generated in the dataloader; the model consumes loader-provided indices.
 
 **NOTE:** Full cached training implementation requires more work. The current caching script is ready, but training code needs adaptation. This is a TODO for optimization.
 
@@ -152,10 +113,10 @@ Currently, `src/train.py` uses `SSv2Dataset` which loads videos. To use cached l
 tail -f /tmp/claude/-home-derekszen-Projects-SALT-VLA/tasks/b94e04b.output
 
 # Check how many cached:
-ls /mnt/ssv2/cached_latents/train/*.pt | wc -l
+ls /mnt/ssv2/cached_latents_v1huge/train/*.pt | wc -l
 
 # Check disk usage:
-du -sh /mnt/ssv2/cached_latents/
+du -sh /mnt/ssv2/cached_latents_v1huge/
 ```
 
 ---
@@ -170,7 +131,7 @@ du -sh /mnt/ssv2/cached_latents/
 **Problem:** Caching was interrupted
 **Solution:** Delete cache dir and re-run:
 ```bash
-rm -rf /mnt/ssv2/cached_latents/train
+rm -rf /mnt/ssv2/cached_latents_v1huge/train
 PYTHONPATH=. uv run python cache_teacher_latents.py --split train
 ```
 

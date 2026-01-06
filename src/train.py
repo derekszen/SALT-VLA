@@ -8,6 +8,11 @@ from contextlib import nullcontext
 import traceback
 from pathlib import Path
 import multiprocessing as mp
+import logging
+import sys
+import signal
+import faulthandler
+import atexit
 import psutil  # For system memory monitoring
 
 import torch
@@ -33,6 +38,93 @@ def _setup_wandb(project: str, run_name: str | None) -> None:
         raise ImportError("wandb is required for logging.") from exc
 
     wandb.init(project=project, name=run_name)
+
+class _Tee:
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
+def _setup_run_logging(run_name: str | None, log_dir: str | Path) -> tuple[logging.Logger, Path]:
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    base_name = run_name or Path(sys.argv[0]).stem or "train"
+    safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in base_name)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"{safe_name}_{timestamp}_pid{os.getpid()}.log"
+
+    log_file = open(log_path, "a", buffering=1)
+    stdout_original = sys.stdout
+    stderr_original = sys.stderr
+    sys.stdout = _Tee(stdout_original, log_file)
+    sys.stderr = _Tee(stderr_original, log_file)
+
+    logger = logging.getLogger("salt.train")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    logging.captureWarnings(True)
+    faulthandler.enable(log_file, all_threads=True)
+
+    def _handle_signal(signum: int, _frame) -> None:
+        logger.error("Received signal %s; shutting down.", signum)
+        raise SystemExit(1)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGABRT):
+        signal.signal(sig, _handle_signal)
+
+    def _excepthook(exc_type, exc, tb) -> None:
+        logger.error("Unhandled exception", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
+
+    def _on_exit() -> None:
+        try:
+            logger.info("Process exiting.")
+        except Exception:
+            pass
+        try:
+            log_file.flush()
+            log_file.close()
+        except Exception:
+            pass
+
+    atexit.register(_on_exit)
+    return logger, log_path
+
+
+def variance_penalty(predictions: torch.Tensor, target_std: float) -> torch.Tensor:
+    pred_flat = predictions.reshape(-1, predictions.shape[-1])
+    if pred_flat.numel() == 0:
+        return pred_flat.sum()
+    std = pred_flat.float().std(dim=0)
+    return torch.relu(target_std - std).mean()
+
+
+def covariance_penalty(predictions: torch.Tensor) -> torch.Tensor:
+    pred_flat = predictions.reshape(-1, predictions.shape[-1])
+    if pred_flat.shape[0] <= 1:
+        return pred_flat.sum() * 0.0
+    pred = pred_flat.float()
+    pred = pred - pred.mean(dim=0)
+    cov = (pred.T @ pred) / (pred.shape[0] - 1)
+    off_diag = cov - torch.diag(torch.diag(cov))
+    return (off_diag ** 2).sum() / pred.shape[1]
 
 
 def train(
@@ -68,10 +160,17 @@ def train(
     grad_accum_steps: int = 1,  # Gradient accumulation steps (virtual batch size)
     variance_loss_weight: float = 0.0,  # VICReg-style variance penalty weight
     variance_target: float = 1.0,  # Target stddev for variance penalty
+    covariance_loss_weight: float = 0.0,  # VICReg-style covariance penalty weight
     use_dataloader_masks: bool = True,  # Use multi-block masks from dataloader
     tubelet_size: int = 2,
     patch_size: int = 16,
+    run_name: str | None = None,
+    log_dir: str | Path = "run_logs",
 ) -> None:
+    logger, log_path = _setup_run_logging(run_name, log_dir)
+    logger.info("Run log file: %s", log_path)
+    logger.info("argv=%s", " ".join(sys.argv))
+
     # CRITICAL: Monitor system memory to prevent PC freezes
     mem = psutil.virtual_memory()
     mem_available_gb = mem.available / (1024**3)
@@ -198,6 +297,8 @@ def train(
             "[startup] variance_loss_weight="
             f"{variance_loss_weight} variance_target={variance_target}"
         )
+    if covariance_loss_weight > 0:
+        print(f"[startup] covariance_loss_weight={covariance_loss_weight}")
     print(
         "[startup] torch="
         f"{torch.__version__} cuda={torch.version.cuda} cudnn={torch.backends.cudnn.version()}"
@@ -254,7 +355,8 @@ def train(
     print(f"[startup] masking_strategy={masking_strategy} grad_clip={grad_clip}")
     print(f"[startup] betas={betas} weight_decay={weight_decay_start}→{weight_decay_end}")
 
-    _setup_wandb(project="salt-vla", run_name="salt-training")
+    wandb_run_name = run_name or "salt-training"
+    _setup_wandb(project="salt-vla", run_name=wandb_run_name)
 
     step = 0
     loader_error_count = 0
@@ -266,17 +368,11 @@ def train(
     
     dataloader_iter = iter(dataloader)
 
-    def variance_loss(predictions: torch.Tensor, target_std: float) -> torch.Tensor:
-        pred_flat = predictions.reshape(-1, predictions.shape[-1])
-        if pred_flat.numel() == 0:
-            return pred_flat.sum()
-        std = pred_flat.float().std(dim=0)
-        return torch.relu(target_std - std).mean()
-
     accum_steps = 0
     accum_loss = 0.0
     accum_mse_loss = 0.0
     accum_var_loss = 0.0
+    accum_cov_loss = 0.0
     last_clips_per_sec = 0.0
     last_decode_time = 0.0
     last_gpu_mem_gb = 0.0
@@ -284,7 +380,7 @@ def train(
 
     def apply_optimizer_step() -> bool:
         nonlocal step
-        nonlocal accum_steps, accum_loss, accum_mse_loss, accum_var_loss
+        nonlocal accum_steps, accum_loss, accum_mse_loss, accum_var_loss, accum_cov_loss
         nonlocal last_step_time, last_clips_per_sec, last_decode_time
         nonlocal last_gpu_mem_gb, last_gpu_mem_max_gb
 
@@ -307,11 +403,15 @@ def train(
         avg_var_loss = (
             accum_var_loss / accum_steps if variance_loss_weight > 0 else 0.0
         )
+        avg_cov_loss = (
+            accum_cov_loss / accum_steps if covariance_loss_weight > 0 else 0.0
+        )
 
         accum_steps = 0
         accum_loss = 0.0
         accum_mse_loss = 0.0
         accum_var_loss = 0.0
+        accum_cov_loss = 0.0
 
         current_time = time.time()
         step_duration = current_time - last_step_time
@@ -340,6 +440,8 @@ def train(
             }
             if variance_loss_weight > 0:
                 wandb_payload["variance_loss"] = avg_var_loss
+            if covariance_loss_weight > 0:
+                wandb_payload["covariance_loss"] = avg_cov_loss
 
             wandb.log(wandb_payload, step=step)
             print(
@@ -529,15 +631,25 @@ def train(
                 # Simple MSE loss - no masking needed (only masked positions returned)
                 mse_loss = nn.functional.mse_loss(pred_masked, teacher_masked)
                 if variance_loss_weight > 0:
-                    var_loss = variance_loss(pred_masked, variance_target)
+                    var_loss = variance_penalty(pred_masked, variance_target)
                 else:
                     var_loss = pred_masked.new_tensor(0.0)
-                loss = mse_loss + variance_loss_weight * var_loss
+                if covariance_loss_weight > 0:
+                    cov_loss = covariance_penalty(pred_masked)
+                else:
+                    cov_loss = pred_masked.new_tensor(0.0)
+                loss = (
+                    mse_loss
+                    + variance_loss_weight * var_loss
+                    + covariance_loss_weight * cov_loss
+                )
                 
             accum_loss += loss.item()
             accum_mse_loss += mse_loss.item()
             if variance_loss_weight > 0:
                 accum_var_loss += var_loss.item()
+            if covariance_loss_weight > 0:
+                accum_cov_loss += cov_loss.item()
             accum_steps += 1
 
             (loss / grad_accum_steps).backward()

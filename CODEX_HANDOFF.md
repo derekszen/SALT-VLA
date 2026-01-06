@@ -67,7 +67,7 @@ cat wandb/latest-run/files/output.log | grep "\[train\]" | awk -F'loss=' '{print
 
 ### What This Project Does
 Trains a ViT-Base vision encoder using V-JEPA (Video Joint Embedding Predictive Architecture):
-- Teacher: Frozen VideoMAEv2-Base provides target latents
+- Teacher: Frozen VideoMAE v1-Huge provides target latents (`Tianjiao-Yu/videomae-huge`)
 - Student: ViT-Base learns to predict masked patch representations
 - Predictor: 12-layer transformer predicts masked tokens from visible ones
 - Loss: MSE between predicted and teacher latents
@@ -94,6 +94,9 @@ train(
     weight_decay_end=0.4,
     mask_ratio=0.75,
     masking_strategy="multiblock",
+    use_cached_latents=True,
+    use_dataloader_masks=True,
+    cache_dir="/mnt/ssv2/cached_latents_v1huge",
     predictor_dim=384,
     predictor_depth=12,
     grad_checkpointing=False,
@@ -138,7 +141,7 @@ PYTHONPATH=. uv run pytest tests/ -v  # Should pass 64 tests
 ### Hardware
 - GPU: NVIDIA RTX 5090 D (31GB VRAM, using 25GB limit)
 - Storage: Samsung 9100 Pro NVMe at /mnt/ssv2
-- Dataset: 168K SSv2 videos, pre-cached latents
+- Dataset: 168K SSv2 videos, cached latents at `/mnt/ssv2/cached_latents_v1huge`
 
 ### Key Learnings to Remember
 1. **LR=3e-4 works better than 1.5e-4** for ViT-Base
@@ -146,6 +149,7 @@ PYTHONPATH=. uv run pytest tests/ -v  # Should pass 64 tests
 3. **3-epoch runs are sufficient** for hyperparameter search
 4. **grad_checkpointing=False** gives 2x throughput
 5. **Loss interpretation**: ~12-15=random, ~11-12=learning, <10=good
+6. **Cached latents are teacher-specific** - recache if the teacher model changes
 
 ### Files to Read
 1. `progress.txt` - Complete training history (START HERE)
@@ -156,7 +160,7 @@ PYTHONPATH=. uv run pytest tests/ -v  # Should pass 64 tests
 ### What NOT to Change
 - Predictor depth (keep at 12, paper-aligned)
 - Batch size (keep at 32, higher causes crashes)
-- Multi-block masking (already implemented correctly)
+- Multi-block masking (now sourced from the dataloader; keep `use_dataloader_masks=True`)
 - Weight decay schedule (already cosine 0.04→0.4)
 
 ### Wandb

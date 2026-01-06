@@ -281,7 +281,7 @@ class SALTModel(nn.Module):
     
     def __init__(
         self,
-        teacher_name: str = "MCG-NJU/videomae-huge",
+        teacher_name: str = "Tianjiao-Yu/videomae-huge",
         student_model_name: str = "vit_base_patch16_224",
         tubelet_size: int = 2,
         patch_size: int = 16,
@@ -603,6 +603,12 @@ class SALTModel(nn.Module):
 
     def _teacher_tokens(self, video: torch.Tensor) -> torch.Tensor:
         teacher = self.teacher.model if hasattr(self.teacher, "model") else self.teacher
+        if hasattr(teacher, "embeddings") and hasattr(teacher, "encoder"):
+            # VideoMAE v1 models use embeddings/encoder and expect (B, T, C, H, W)
+            pixel_values = video.permute(0, 2, 1, 3, 4)
+            outputs = teacher(pixel_values=pixel_values)
+            return outputs.last_hidden_state
+
         x = teacher.patch_embed(video)
         if getattr(teacher, "pos_embed", None) is not None:
             x = x + teacher.pos_embed.expand(x.shape[0], -1, -1).type_as(x).to(

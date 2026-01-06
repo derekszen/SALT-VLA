@@ -300,3 +300,141 @@ Recent runs visible in wandb/latest-run/ directory.
 ================================================================================
 # End of Progress Log
 ================================================================================
+
+================================================================================
+                    UPDATE: VideoMAE v1-Huge + Loader Masks (2026-01-06)
+================================================================================
+
+## Architecture Changes Applied
+- Teacher switched to VideoMAE v1-Huge.
+  - Tried: MCG-NJU/videomae-huge (404 from HF)
+  - Now using: Tianjiao-Yu/videomae-huge
+- Teacher token extraction updated to support VideoMAE v1 API (embeddings/encoder path).
+- Multi-block masking moved into the DataLoader via new masked dataset classes.
+- Legacy loader preserved for rollback: src/data/loader_legacy.py
+
+## DataLoader Masking Implementation
+- Added SSv2MaskedDataset + collate_drop_none_with_masks (videos + visible/masked indices).
+- Added HybridSSv2MaskedDataset + collate_hybrid_with_masks (videos + cached latents + masks).
+- SALTModel forward now accepts optional visible_idx/masked_idx to use loader masks.
+
+## Training Script Updates
+- All train_*.py scripts updated:
+  - cache_dir -> /mnt/ssv2/cached_latents_v1huge
+  - use_dataloader_masks=True
+
+## Re-cache Status (VideoMAE v1-Huge)
+- Started caching train split to /mnt/ssv2/cached_latents_v1huge
+  - Command: PYTHONPATH=. uv run python cache_teacher_latents.py --split train --cache_dir /mnt/ssv2/cached_latents_v1huge
+  - Current throughput ~170 v/s early in run
+
+## Training Queue
+- Queued training to start AFTER cache metadata exists:
+  - Script: train_vitb_exp1_higherlr.py
+  - Queue log: /tmp/v1huge_queue.log
+  - Training log: /tmp/v1huge_exp1.log
+
+## Notes / Rollback
+- To rollback masking changes: set use_dataloader_masks=False and/or revert to src/data/loader_legacy.py.
+- If different VideoMAE v1-Huge repo is desired, update teacher_name accordingly.
+
+================================================================================
+                UPDATE: Cache Complete + Exp1 Run Debug (2026-01-06)
+================================================================================
+
+## Cache + Integrity
+- VideoMAE v1-Huge cache completed successfully.
+  - Location: /mnt/ssv2/cached_latents_v1huge/train
+  - 168,903 videos cached, ~181 v/s, metadata.json written.
+- Dataset integrity test passed:
+  - tests/test_cached_dataset_integrity.py
+
+## Training Run Issue
+- Exp1 run (train_vitb_exp1_higherlr.py) exited early after step 20 with no visible traceback.
+  - WandB run: 6nf7tfls (run-20260106_105238-6nf7tfls)
+  - output.log only shows up to step 20.
+  - WandB core log shows: "parent process exited" at 10:53:38.
+- Suspected cause: process killed (no stdout error). Need rerun with explicit stdout log capture.
+
+## Training Run Restart + Monitoring
+- Re-ran Exp1 with stdout capture to /tmp/v1huge_exp1.log for debugging.
+  - WandB run: iqfto9ul (run-20260106_120220-iqfto9ul)
+  - Passed step 300 without errors (stable ~200 clips/s).
+  - Early-exit issue not reproduced so far; monitoring continues.
+
+================================================================================
+                UPDATE: Exp1 Run Terminated Early (2026-01-06)
+================================================================================
+
+## Observed Behavior
+- Exp1 (train_vitb_exp1_higherlr.py) stopped at step 10180 (~1.93 epochs) with no traceback.
+- Last log entries: /tmp/v1huge_exp1.log
+- WandB core log shows: "parent process exited, terminating service process" at 12:29:38.
+
+## Likely Cause
+- The training process appears to have died with its parent shell/session (no Python error).
+- Recommend running via nohup/tmux or a queued job script to avoid parent-exit kills.
+
+================================================================================
+                UPDATE: Run Logging System + Relaunch Plan (2026-01-06)
+================================================================================
+
+## Logging System (Implemented)
+- Added run-level logging in src/train.py:
+  - Tee stdout/stderr into a timestamped log file.
+  - faulthandler + uncaught exception hook + SIGTERM/SIGINT/SIGABRT handlers.
+  - Logs stored under run_logs/ by default.
+- train_vitb_exp1_higherlr.py now accepts:
+  - RUN_NAME (default: vitb_exp1_higherlr_v1huge)
+  - RUN_LOG_DIR (default: run_logs)
+
+## Fix Strategy
+- Root cause is parent shell exit, not teacher size (cached latents used).
+- Relaunch using setsid (detached) so parent exit does not kill training.
+
+## Relaunched Run (Detached)
+- Started Exp1 via setsid with logging enabled.
+  - RUN_NAME=vitb_exp1_higherlr_v1huge
+  - Log file: run_logs/vitb_exp1_higherlr_v1huge_20260106_130118_pid338733.log
+  - WandB run: j4eyugld
+
+================================================================================
+                UPDATE: Exp1 3-Epoch Results (2026-01-06)
+================================================================================
+
+## Loss Curve Summary
+- Completed 3 epochs (steps ~0 → 15820).
+- Epoch averages:
+  - Epoch 1 avg loss ~12.0265
+  - Epoch 2 avg loss ~11.6939
+  - Epoch 3 avg loss ~11.5770
+- Best observed loss: 10.4994 at step 12940 (not sustained).
+- Last-100-step avg loss: ~11.5746 (plateau).
+
+## Interpretation (Paper Critique Context)
+- Loss improves but with diminishing returns; trend suggests a plateau ~11.5.
+- Matches critique: pure MSE on fixed teacher may plateau early.
+- Additional epochs alone likely low ROI unless loss/objective is adjusted (e.g., variance/contrastive term).
+
+================================================================================
+                UPDATE: VICReg-Style Penalties + 10-Epoch Run (2026-01-06)
+================================================================================
+
+## Code Changes
+- Added VICReg-style covariance penalty in src/train.py:
+  - covariance_loss_weight param (off-diagonal covariance penalty).
+  - Logs covariance_loss alongside variance_loss when enabled.
+- New training script:
+  - train_vitb_exp1_higherlr_vicreg10.py
+  - 10 epochs, variance_loss_weight=1.0, covariance_loss_weight=0.1
+
+## New Run (Detached)
+- RUN_NAME=vitb_exp1_higherlr_vicreg10_v1huge
+- Launcher log: /tmp/setsid_train_vicreg10.log
+- Run log: run_logs/vitb_exp1_higherlr_vicreg10_v1huge_20260106_165129_pid1197207.log
+- WandB run: c1sk8d6s
+
+## Tests + Docs
+- Added variance_penalty + covariance_penalty helpers in src/train.py for unit tests.
+- Added tests for VICReg-style regularizers in tests/test_training_components.py.
+- Updated START_HERE.md with a test plan section covering the new tests.

@@ -37,6 +37,11 @@ def test_dataloader_preflight() -> None:
     max_batches = int(os.environ.get("PREFLIGHT_BATCHES", "20"))
     default_context = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
     mp_context = os.environ.get("PREFLIGHT_MP_CONTEXT", default_context)
+    if num_workers > 0:
+        try:
+            mp.get_context(mp_context).Lock()
+        except PermissionError:
+            num_workers = 0
 
     dataset = SSv2Dataset(data_root, split="train")
     loader_kwargs = {}
@@ -57,7 +62,23 @@ def test_dataloader_preflight() -> None:
     )
 
     ok_batches = 0
-    loader_iter = iter(loader)
+    try:
+        loader_iter = iter(loader)
+    except PermissionError as exc:
+        if num_workers > 0:
+            # Some environments disallow multiprocessing semaphores.
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True,
+                collate_fn=collate_drop_none,
+                drop_last=True,
+            )
+            loader_iter = iter(loader)
+        else:
+            raise AssertionError(f"DataLoader PermissionError: {exc}") from exc
     try:
         for _ in range(max_batches):
             try:

@@ -1,9 +1,18 @@
 """Shared test fixtures and configuration for SALT-VLA tests."""
 from __future__ import annotations
 
+import os
+import tempfile
+
 import pytest
 import torch
 import math
+
+# Ensure a writable temp directory for imports that allocate temp files.
+os.environ.setdefault("TMPDIR", "/tmp")
+os.environ.setdefault("TEMP", "/tmp")
+os.environ.setdefault("TMP", "/tmp")
+tempfile.tempdir = "/tmp"
 
 
 # ============================================================================

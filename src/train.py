@@ -45,13 +45,20 @@ class _Tee:
 
     def write(self, data: str) -> int:
         for stream in self._streams:
-            stream.write(data)
-            stream.flush()
+            try:
+                stream.write(data)
+                stream.flush()
+            except Exception:
+                # Avoid fatal errors during interpreter shutdown (e.g., closed file).
+                pass
         return len(data)
 
     def flush(self) -> None:
         for stream in self._streams:
-            stream.flush()
+            try:
+                stream.flush()
+            except Exception:
+                pass
 
 
 def _setup_run_logging(run_name: str | None, log_dir: str | Path) -> tuple[logging.Logger, Path]:
@@ -96,6 +103,11 @@ def _setup_run_logging(run_name: str | None, log_dir: str | Path) -> tuple[loggi
     def _on_exit() -> None:
         try:
             logger.info("Process exiting.")
+        except Exception:
+            pass
+        try:
+            sys.stdout = stdout_original
+            sys.stderr = stderr_original
         except Exception:
             pass
         try:
@@ -186,11 +198,18 @@ def train(
     
     # CRITICAL: Set custom temp directory to avoid disk quota errors
     # Large training set (168K samples) with shuffle creates excessive temp files
-    TORCH_TMP_DIR = "/mnt/ssv2/.torch_tmp"
-    os.makedirs(TORCH_TMP_DIR, exist_ok=True)
-    os.environ['TMPDIR'] = TORCH_TMP_DIR
-    os.environ['TEMP'] = TORCH_TMP_DIR
-    os.environ['TMP'] = TORCH_TMP_DIR
+    TORCH_TMP_DIR = os.environ.get("SALT_TMPDIR", "/mnt/ssv2/.torch_tmp")
+    try:
+        os.makedirs(TORCH_TMP_DIR, exist_ok=True)
+        probe_dir = tempfile.mkdtemp(dir=TORCH_TMP_DIR)
+        os.rmdir(probe_dir)
+    except Exception as exc:
+        fallback = tempfile.gettempdir()
+        print(f"[startup] temp_dir={TORCH_TMP_DIR} unavailable ({exc}); falling back to {fallback}")
+        TORCH_TMP_DIR = fallback
+    os.environ["TMPDIR"] = TORCH_TMP_DIR
+    os.environ["TEMP"] = TORCH_TMP_DIR
+    os.environ["TMP"] = TORCH_TMP_DIR
     tempfile.tempdir = TORCH_TMP_DIR
     print(f"[startup] temp_dir={TORCH_TMP_DIR}")
 

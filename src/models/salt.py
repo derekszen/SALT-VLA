@@ -282,6 +282,8 @@ class SALTModel(nn.Module):
     def __init__(
         self,
         teacher_name: str = "Tianjiao-Yu/videomae-huge",
+        load_teacher: bool = True,
+        teacher_dim: int | None = None,
         student_model_name: str = "vit_base_patch16_224",
         tubelet_size: int = 2,
         patch_size: int = 16,
@@ -296,19 +298,27 @@ class SALTModel(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
-        from transformers import AutoModel
-        
+        self.teacher_name = teacher_name
+
         # 1. Teacher setup (frozen)
-        self.teacher = AutoModel.from_pretrained(
-            teacher_name, 
-            trust_remote_code=True,
-            dtype=dtype
-        )
-        self.teacher.eval()
-        for param in self.teacher.parameters():
-            param.requires_grad = False
-        
-        self.teacher_dim = self._get_teacher_dim(self.teacher.config)
+        if load_teacher:
+            from transformers import AutoModel
+
+            self.teacher: nn.Module | None = AutoModel.from_pretrained(
+                teacher_name,
+                trust_remote_code=True,
+                dtype=dtype,
+            )
+            self.teacher.eval()
+            for param in self.teacher.parameters():
+                param.requires_grad = False
+
+            self.teacher_dim = self._get_teacher_dim(self.teacher.config)
+        else:
+            self.teacher = None
+            if teacher_dim is None:
+                raise ValueError("teacher_dim is required when load_teacher=False.")
+            self.teacher_dim = int(teacher_dim)
 
         # 2. Student setup
         self.student = StudentVideoViT(
@@ -397,6 +407,11 @@ class SALTModel(nn.Module):
             # Use cached latents - gather masked positions
             teacher_masked = self._gather_patches(cached_teacher_latents, masked_idx)
         else:
+            if self.teacher is None:
+                raise ValueError(
+                    "Teacher model is not loaded; provide cached_teacher_latents "
+                    "or construct SALTModel with load_teacher=True."
+                )
             # Compute teacher on-the-fly
             with torch.no_grad():
                 teacher_all = self._teacher_tokens(video)
@@ -507,7 +522,6 @@ class SALTModel(nn.Module):
                 keep_masked = num_masked
                 perm = torch.randperm(len(masked_positions), device=device)
                 masked_positions = masked_positions[perm[:keep_masked]]
-                extra_visible = masked_positions[perm[keep_masked:]] if keep_masked < current_masked else torch.tensor([], device=device, dtype=torch.long)
                 # Recalculate visible positions
                 all_positions = torch.arange(num_patches, device=device)
                 mask = torch.ones(num_patches, dtype=torch.bool, device=device)
@@ -541,7 +555,8 @@ class SALTModel(nn.Module):
 
     def train(self, mode: bool = True) -> "SALTModel":
         super().train(mode)
-        self.teacher.eval()
+        if self.teacher is not None:
+            self.teacher.eval()
         return self
 
     @staticmethod
@@ -602,6 +617,8 @@ class SALTModel(nn.Module):
         return patch_tokens.reshape(mask_tokens.shape[0], grid_t, grid_h, grid_w)
 
     def _teacher_tokens(self, video: torch.Tensor) -> torch.Tensor:
+        if self.teacher is None:
+            raise ValueError("Teacher model is not loaded.")
         teacher = self.teacher.model if hasattr(self.teacher, "model") else self.teacher
         if hasattr(teacher, "embeddings") and hasattr(teacher, "encoder"):
             # VideoMAE v1 models use embeddings/encoder and expect (B, T, C, H, W)

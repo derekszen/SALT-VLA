@@ -6,6 +6,7 @@ import os
 import tempfile
 from contextlib import nullcontext
 import traceback
+import json
 from pathlib import Path
 import multiprocessing as mp
 import logging
@@ -323,6 +324,27 @@ def train(
         f"{torch.__version__} cuda={torch.version.cuda} cudnn={torch.backends.cudnn.version()}"
     )
 
+    teacher_dim: int | None = None
+    teacher_tokens: int | None = None
+    if use_cached_latents:
+        latent_shape: tuple[int, int] | None = None
+        if hasattr(dataset, "latent_dataset") and hasattr(dataset.latent_dataset, "latent_shape"):
+            latent_shape = tuple(dataset.latent_dataset.latent_shape)  # type: ignore[assignment]
+        else:
+            metadata_path = Path(cache_dir) / split / "metadata.json"
+            if metadata_path.exists():
+                with metadata_path.open("r") as f:
+                    metadata = json.load(f)
+                if "latent_shape" in metadata:
+                    latent_shape = tuple(metadata["latent_shape"])
+        if latent_shape is None or len(latent_shape) != 2:
+            raise ValueError(
+                "Unable to infer cached latent shape; expected metadata.json with latent_shape "
+                f"under {Path(cache_dir) / split}."
+            )
+        teacher_tokens, teacher_dim = int(latent_shape[0]), int(latent_shape[1])
+        print(f"[startup] cached_latents_shape=(N={teacher_tokens}, D={teacher_dim})")
+
     model = SALTModel(
         mask_ratio=mask_ratio,
         masking_strategy=masking_strategy,  # NEW
@@ -333,6 +355,8 @@ def train(
         predictor_dim=predictor_dim,  # NEW
         predictor_depth=predictor_depth,  # NEW
         predictor_num_heads=predictor_num_heads,  # NEW
+        load_teacher=not use_cached_latents,
+        teacher_dim=teacher_dim if use_cached_latents else None,
     )
     model.student.set_grad_checkpointing(grad_checkpointing)
     model.to(device=device, dtype=model_dtype)
@@ -477,6 +501,12 @@ def train(
     expected_patches = (16 // tubelet_size) * (224 // patch_size) * (224 // patch_size)
     expected_masked = int(expected_patches * mask_ratio)
     expected_visible = expected_patches - expected_masked
+    if use_cached_latents and teacher_tokens is not None and teacher_tokens != expected_patches:
+        raise ValueError(
+            "[preflight] Cached latent token count mismatch: "
+            f"cache N={teacher_tokens} expected_patches={expected_patches}. "
+            "Check cache_dir, num_frames, tubelet_size, patch_size, and img_size."
+        )
 
     try:
         preflight_batch = next(dataloader_iter)
@@ -490,8 +520,10 @@ def train(
                 videos, latents, visible_idx, masked_idx = preflight_batch
                 if videos.shape[1:] != (3, 16, 224, 224):
                     raise ValueError("[preflight] Expected video shape (B, 3, 16, 224, 224).")
-                if latents.ndim != 3 or latents.shape[1:] != (1568, 768):
-                    raise ValueError(f"[preflight] Expected latent shape (B, 1568, 768), got {latents.shape}.")
+                if latents.ndim != 3 or latents.shape[1] != expected_patches or latents.shape[2] != teacher_dim:
+                    raise ValueError(
+                        f"[preflight] Expected latent shape (B, {expected_patches}, {teacher_dim}), got {latents.shape}."
+                    )
                 if visible_idx.shape[1] != expected_visible or masked_idx.shape[1] != expected_masked:
                     raise ValueError("[preflight] Mask indices shape mismatch for expected patch count.")
                 print(
@@ -507,8 +539,10 @@ def train(
                 videos, latents = preflight_batch
                 if videos.shape[1:] != (3, 16, 224, 224):
                     raise ValueError("[preflight] Expected video shape (B, 3, 16, 224, 224).")
-                if latents.ndim != 3 or latents.shape[1:] != (1568, 768):
-                    raise ValueError(f"[preflight] Expected latent shape (B, 1568, 768), got {latents.shape}.")
+                if latents.ndim != 3 or latents.shape[1] != expected_patches or latents.shape[2] != teacher_dim:
+                    raise ValueError(
+                        f"[preflight] Expected latent shape (B, {expected_patches}, {teacher_dim}), got {latents.shape}."
+                    )
                 print(f"[preflight] first batch: videos={tuple(videos.shape)}, latents={tuple(latents.shape)}")
         elif use_dataloader_masks:
             # Non-cached mode with dataloader masks

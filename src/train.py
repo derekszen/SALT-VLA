@@ -382,6 +382,15 @@ def train(
         teacher_tokens, teacher_dim = int(latent_shape[0]), int(latent_shape[1])
         print(f"[startup] cached_latents_shape=(N={teacher_tokens}, D={teacher_dim})")
 
+    # Model architecture toggles (kept as env vars to avoid churn in experiment scripts).
+    student_space_time_blocks = int(os.environ.get("SALT_STUDENT_SPACE_TIME_BLOCKS", "0"))
+    use_predictor_env = os.environ.get("SALT_USE_PREDICTOR", "1").strip().lower()
+    use_predictor = use_predictor_env not in ("0", "false", "no", "off")
+    print(
+        f"[startup] student_space_time_blocks={student_space_time_blocks} "
+        f"use_predictor={use_predictor}"
+    )
+
     model = SALTModel(
         mask_ratio=mask_ratio,
         masking_strategy=masking_strategy,  # NEW
@@ -389,6 +398,8 @@ def train(
         student_model_name=student_model_name,
         tubelet_size=tubelet_size,
         patch_size=patch_size,
+        student_space_time_blocks=student_space_time_blocks,
+        use_predictor=use_predictor,
         predictor_dim=predictor_dim,  # NEW
         predictor_depth=predictor_depth,  # NEW
         predictor_num_heads=predictor_num_heads,  # NEW

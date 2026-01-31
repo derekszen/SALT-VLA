@@ -76,15 +76,18 @@ secrets/
 .secrets/
 
 # Temporary test/iteration scripts
-test_*.py
-train_*.py
-run_*.py
-cache_*.py
-monitor_*.py
-check_*.py
-queue_*.py
-log_*.py
-safety_*.py
+/test_*.py
+/train_*.py
+/run_*.py
+/cache_*.py
+/monitor_*.py
+/check_*.py
+/queue_*.py
+/log_*.py
+/safety_*.py
+
+# Keep real unit tests tracked (the patterns above are for ad-hoc root scripts).
+!tests/test_*.py
 
 # Editor/OS noise
 .DS_Store

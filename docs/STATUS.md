@@ -43,4 +43,4 @@ Most recent run
 
 **Context:** Short A/B to test a looser schedule (LR/min_lr up, grad clip relaxed) before committing to long runs.  
 **Issue:** 3-epoch avg loss 11.3528; needs validation/probe checks to judge early slope vs baseline.  
-**Solution:** Run `eval_distill_loss.py` + temporal probe suite from a normal shell (GPU + network). The agent sandbox blocks HF downloads and multiprocessing semaphores.
+**Solution:** Run `scripts/eval_distill_loss.py` + temporal probe suite from a normal shell (GPU + network). The agent sandbox blocks HF downloads and multiprocessing semaphores.

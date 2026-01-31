@@ -5,6 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from src.models.tubelet_space_time import TubeletSpaceTimeBlock
+
 
 class PatchEmbed3D(nn.Module):
     def __init__(
@@ -53,6 +55,7 @@ class StudentVideoViT(nn.Module):
         patch_size: int,
         num_frames: int,
         img_size: int,
+        space_time_blocks: int = 0,
     ) -> None:
         super().__init__()
         import timm
@@ -81,6 +84,22 @@ class StudentVideoViT(nn.Module):
         self.num_frames = num_frames
         self.patch_size = patch_size
         self.tubelet_size = tubelet_size
+        self.space_time_blocks = int(space_time_blocks)
+
+        # Dense masking uses a learned token embedding in the student token space.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+        # Optional: replace early-block attention with divided (time then space) attention.
+        if self.space_time_blocks > 0:
+            n_blocks = len(self.vit.blocks)
+            n_st = min(self.space_time_blocks, n_blocks)
+            for i in range(n_st):
+                self.vit.blocks[i].attn = TubeletSpaceTimeBlock(
+                    self.vit.blocks[i].attn,
+                    num_frames=num_frames,
+                    tubelet_size=tubelet_size,
+                )
 
     def _inflate_pos_embed(
         self, pos_embed: torch.Tensor, grid_size: tuple[int, int, int]
@@ -127,6 +146,12 @@ class StudentVideoViT(nn.Module):
         Returns:
             Visible patch representations (B, N_visible, D)
         """
+        if self.space_time_blocks > 0:
+            raise ValueError(
+                "forward_visible_only is not compatible with divided space-time attention, "
+                "because token counts are no longer a regular (T x S) grid after masking. "
+                "Use dense masking (mask-token replacement) instead."
+            )
         B, N_visible = visible_indices.shape
         D = patch_embeds.shape[-1]
         
@@ -149,6 +174,46 @@ class StudentVideoViT(nn.Module):
         x = self.vit.norm(x)
         
         return x  # (B, N_visible, D)
+
+    def forward_dense(
+        self,
+        patch_embeds: torch.Tensor,
+        masked_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Process a full (dense) tubelet token grid through the ViT blocks.
+
+        This is the day-1 path for divided space-time attention: keep tokens dense,
+        replace masked positions with a learned mask token, and compute loss on masked
+        positions only.
+
+        Args:
+            patch_embeds: All patch embeddings (B, N_total, D) from patch_embed layer.
+            masked_indices: Optional indices of masked patches (B, N_masked). If provided,
+                those positions are replaced with self.mask_token before the transformer.
+
+        Returns:
+            Patch representations (B, N_total, D) (no CLS token).
+        """
+        B, N_total, D = patch_embeds.shape
+
+        # 1. Add positional embeddings for all patch positions (no CLS token).
+        pos_embed_patches = self.vit.pos_embed[:, 1:]  # (1, N_total, D)
+        x = patch_embeds + pos_embed_patches[:, :N_total].to(dtype=patch_embeds.dtype)
+
+        # 2. Replace masked positions with a learned token embedding.
+        if masked_indices is not None:
+            idx = masked_indices.to(device=patch_embeds.device, dtype=torch.long)
+            idx_expanded = idx.unsqueeze(-1).expand(-1, -1, D)
+            mask_tok = self.mask_token.to(dtype=patch_embeds.dtype).expand(B, idx.shape[1], D)
+            x = x.scatter(1, idx_expanded, mask_tok)
+
+        # 3. ViT blocks (dense tokens; no CLS token)
+        x = self.vit.patch_drop(x)
+        x = self.vit.norm_pre(x)
+        for blk in self.vit.blocks:
+            x = blk(x)
+        x = self.vit.norm(x)
+        return x
 
 
 class JEPAPredictor(nn.Module):
@@ -291,6 +356,10 @@ class SALTModel(nn.Module):
         img_size: int = 224,
         mask_ratio: float = 0.75,
         masking_strategy: str = "multiblock",  # NEW: "random" or "multiblock"
+        # Student attention mode
+        student_space_time_blocks: int = 0,  # 0 = joint attention everywhere (default)
+        # Prediction mode
+        use_predictor: bool = True,  # If False: dense mask-token path + linear head (no predictor)
         # Predictor config
         predictor_dim: int = 384,
         predictor_depth: int = 6,
@@ -327,20 +396,36 @@ class SALTModel(nn.Module):
             patch_size=patch_size,
             num_frames=num_frames,
             img_size=img_size,
+            space_time_blocks=student_space_time_blocks,
         ).to(dtype=dtype)
-        
+
         num_patches = self.student.num_patches  # 1568 for default config
 
-        # 3. Predictor (replaces simple linear projection)
-        self.predictor = JEPAPredictor(
-            student_dim=self.student.embed_dim,
-            teacher_dim=self.teacher_dim,
-            predictor_dim=predictor_dim,
-            depth=predictor_depth,
-            num_heads=predictor_num_heads,
-            num_patches=num_patches,
-            dtype=dtype,
-        )
+        if student_space_time_blocks > 0 and use_predictor:
+            raise ValueError(
+                "student_space_time_blocks > 0 requires dense masking (use_predictor=False). "
+                "Divided space-time attention needs a dense (T x S) token grid."
+            )
+
+        self.use_predictor = bool(use_predictor)
+        if self.use_predictor:
+            # 3. Predictor (V-JEPA style): visible-only student + transformer predictor
+            self.predictor: JEPAPredictor | None = JEPAPredictor(
+                student_dim=self.student.embed_dim,
+                teacher_dim=self.teacher_dim,
+                predictor_dim=predictor_dim,
+                depth=predictor_depth,
+                num_heads=predictor_num_heads,
+                num_patches=num_patches,
+                dtype=dtype,
+            )
+            self.student_to_teacher: nn.Linear | None = None
+        else:
+            # 3. Minimal day-1 path: dense student tokens + linear projection to teacher dim.
+            self.predictor = None
+            self.student_to_teacher = nn.Linear(
+                self.student.embed_dim, self.teacher_dim, bias=True, dtype=dtype
+            )
 
         self.mask_ratio = mask_ratio
         self.masking_strategy = masking_strategy  # NEW
@@ -393,15 +478,23 @@ class SALTModel(nn.Module):
             masked_idx = masked_idx.to(device=device, dtype=torch.long)
         
         # 3. Student processes ONLY visible patches
-        student_out = self.student.forward_visible_only(patch_embeds, visible_idx)  # (B, N_visible, D_s)
-        
-        # 4. Predictor reconstructs masked positions
-        pred_masked = self.predictor(
-            visible_tokens=student_out,
-            visible_indices=visible_idx,
-            masked_indices=masked_idx,
-        )  # (B, N_masked, D_teacher)
-        
+        if self.predictor is None:
+            if self.student_to_teacher is None:
+                raise RuntimeError("student_to_teacher is not initialized.")
+            # Dense token grid: replace masked positions with mask token; loss only on masked positions.
+            student_all = self.student.forward_dense(patch_embeds, masked_indices=masked_idx)
+            student_masked = self._gather_patches(student_all, masked_idx)
+            pred_masked = self.student_to_teacher(student_masked)
+        else:
+            student_out = self.student.forward_visible_only(patch_embeds, visible_idx)  # (B, N_visible, D_s)
+
+            # 4. Predictor reconstructs masked positions
+            pred_masked = self.predictor(
+                visible_tokens=student_out,
+                visible_indices=visible_idx,
+                masked_indices=masked_idx,
+            )  # (B, N_masked, D_teacher)
+
         # 5. Get teacher targets for masked positions
         if cached_teacher_latents is not None:
             # Use cached latents - gather masked positions

@@ -62,12 +62,12 @@ Remaining root issues / likely causes of “plateau”
 Fixes added (2026-01-10)
 - `src/train.py`: save student/predictor checkpoints (no teacher) to `checkpoints/<run_log_stem>/{best.pth,last.pth}`.
 - `train_vitl_10epoch.py`: allow env overrides for `EPOCHS`, `WEIGHT_DECAY_{START,END}`, and predictor config.
-- `eval_distill_loss.py`: evaluate masked-latent MSE on `split=validation` (teacher on-the-fly) for any saved checkpoint.
+- `scripts/eval_distill_loss.py`: evaluate masked-latent MSE on `split=validation` (teacher on-the-fly) for any saved checkpoint.
 
 Next steps (after this run)
 - Given the rebound is largely fixed, focus on lowering the floor: tune `weight_decay_end` (try 0.2), and/or add light VICReg variance/covariance penalties for ViT-L.
 - If we want a direct A/B: rerun ViT-L 10-epoch with identical hyperparams except `weight_decay_end` and compare (min + last-2k-step avg).
-  - After any run that saves checkpoints: run `PYTHONPATH=. ./.venv/bin/python eval_distill_loss.py --checkpoint checkpoints/<run>/best.pth --split validation --max-batches 200`.
+  - After any run that saves checkpoints: run `PYTHONPATH=. ./.venv/bin/python scripts/eval_distill_loss.py --checkpoint checkpoints/<run>/best.pth --split validation --max-batches 200`.
   - If val MSE improves but downstream (linear probe / robotics) does not, the issue is objective ↔ downstream mismatch, not “plateau”.
 
 Queued / running next experiment
@@ -77,10 +77,10 @@ Queued / running next experiment
 - Log: `run_logs/vitl_10epoch_wdgroups_lr2e4_wdend0p2_20260110_115453_pid3763572.log`
 
 Fast “physics-ish” sanity benchmark (SSv2 time-arrow probe)
-- Added: `bench_time_arrow_ssv2.py` (linear probe to classify forward vs time-reversed clips from frozen student embeddings).
+- Added: `scripts/bench_time_arrow_ssv2.py` (linear probe to classify forward vs time-reversed clips from frozen student embeddings).
 - Why: cheap check that representations encode temporal directionality (often correlates with motion/physics sensitivity).
 - Manual run (after checkpoints exist):
-  - `.venv/bin/python bench_time_arrow_ssv2.py --checkpoint checkpoints/<run_log_stem>/best.pth --train-videos 2000 --val-videos 1000 --out benchmarks/time_arrow/<run_log_stem>.json`
+  - `.venv/bin/python scripts/bench_time_arrow_ssv2.py --checkpoint checkpoints/<run_log_stem>/best.pth --train-videos 2000 --val-videos 1000 --out benchmarks/time_arrow/<run_log_stem>.json`
 - Auto-run helper:
   - `scripts/queue_time_arrow_after_run.py` waits for a log to finish (looks for “Process exiting.”) then runs the probe.
   - Currently queued via systemd: `salt-time-arrow-wdend0p2.service` (will write to `benchmarks/time_arrow/` after the current training run exits).

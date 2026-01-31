@@ -5,7 +5,7 @@ This loads a checkpoint produced by `src/train.py` (student + predictor only)
 and computes MSE(pred_masked, teacher_masked) on the requested split.
 
 Example:
-  PYTHONPATH=. ./.venv/bin/python eval_distill_loss.py \\
+  PYTHONPATH=. ./.venv/bin/python scripts/eval_distill_loss.py \\
     --checkpoint checkpoints/<run>/best.pth \\
     --split validation \\
     --max-batches 200

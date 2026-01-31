@@ -33,3 +33,6 @@ lint.ignore = ["E731"] # Allow lambdas for quick research transforms
 
 [tool.ruff.lint.isort]
 known-first-party = ["SALT-VLA"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

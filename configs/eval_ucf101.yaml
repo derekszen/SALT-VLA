@@ -1,0 +1,4 @@
+data_root: /mnt/ucf101
+split: test
+batch_size: 8
+num_workers: 4

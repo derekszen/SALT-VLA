@@ -1,0 +1,6 @@
+cache_dir: /mnt/ssv2/cache_videomae_huge_384
+split: train
+limit: 1000
+batch_size: 4
+num_workers: 4
+seed: 0

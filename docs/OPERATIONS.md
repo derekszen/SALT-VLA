@@ -2,8 +2,9 @@
 
 Quick start
 - Safety check: PYTHONPATH=. ./.venv/bin/python scripts/safety_test.py
-- Training: PYTHONPATH=. ./.venv/bin/python src/train.py
-  - Hybrid ST (dense mask tokens): SALT_USE_PREDICTOR=0 SALT_STUDENT_SPACE_TIME_BLOCKS=9 PYTHONPATH=. ./.venv/bin/python src/train.py
+- Training (cached latents): PYTHONPATH=. ./.venv/bin/python scripts/train.py --use-cached-latents 1 --cache-dir /mnt/ssv2/cached_latents_v1huge
+  - Hybrid ST (dense mask tokens): PYTHONPATH=. ./.venv/bin/python scripts/train.py --use-cached-latents 1 --use-predictor 0 --student-space-time-blocks 9
+- Training (non-cached): PYTHONPATH=. ./.venv/bin/python scripts/train.py --use-cached-latents 0
 
 Caching latents (VideoMAE v1-Huge)
 - Cache train split:

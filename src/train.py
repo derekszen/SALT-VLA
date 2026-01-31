@@ -121,6 +121,39 @@ def _setup_run_logging(run_name: str | None, log_dir: str | Path) -> tuple[loggi
     return logger, log_path
 
 
+def _setup_checkpoint_dir(log_path: Path, checkpoint_dir: str | Path) -> Path:
+    ckpt_root = Path(checkpoint_dir)
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    run_dir = ckpt_root / log_path.stem
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _save_checkpoint(
+    *,
+    path: Path,
+    model: SALTModel,
+    step: int,
+    epoch: int,
+    metrics: dict[str, object],
+    config: dict[str, object],
+) -> None:
+    # Keep checkpoints focused on trainable components; avoid saving the frozen teacher.
+    ckpt = {
+        "step": int(step),
+        "epoch": int(epoch),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": config,
+        "metrics": metrics,
+        "state_dict": {
+            "student": model.student.state_dict(),
+            "predictor": model.predictor.state_dict(),
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt, path)
+
+
 def variance_penalty(predictions: torch.Tensor, target_std: float) -> torch.Tensor:
     pred_flat = predictions.reshape(-1, predictions.shape[-1])
     if pred_flat.numel() == 0:
@@ -169,6 +202,7 @@ def train(
     # THROUGHPUT options
     grad_checkpointing: bool = True,  # Disable for +50-100% speed (uses more VRAM)
     cudnn_benchmark: bool = False,  # Enable for +5-15% speed (less deterministic)
+    torch_compile_mode: str | None = None,  # e.g., "max-autotune", "reduce-overhead", or "off"
     # Training stability options
     grad_accum_steps: int = 1,  # Gradient accumulation steps (virtual batch size)
     variance_loss_weight: float = 0.0,  # VICReg-style variance penalty weight
@@ -179,6 +213,9 @@ def train(
     patch_size: int = 16,
     run_name: str | None = None,
     log_dir: str | Path = "run_logs",
+    checkpoint_dir: str | Path | None = "checkpoints",
+    save_last_checkpoint: bool = True,
+    save_best_checkpoint: bool = True,
 ) -> None:
     logger, log_path = _setup_run_logging(run_name, log_dir)
     logger.info("Run log file: %s", log_path)
@@ -361,24 +398,77 @@ def train(
     model.student.set_grad_checkpointing(grad_checkpointing)
     model.to(device=device, dtype=model_dtype)
     if device.type == "cuda":
-        model = torch.compile(model, mode="max-autotune")
+        compile_mode = torch_compile_mode
+        if compile_mode is None:
+            compile_mode = os.getenv("TORCH_COMPILE_MODE")
+        compile_mode_norm = (compile_mode or "").strip().lower()
+        if compile_mode_norm in ("", "1", "true", "yes", "on"):
+            compile_mode_norm = "max-autotune"
+        if compile_mode_norm not in ("0", "false", "no", "off", "none"):
+            model = torch.compile(model, mode=compile_mode_norm)
+        print(f"[startup] torch_compile={compile_mode_norm}")
+
+    def _build_adamw_param_groups(
+        module: nn.Module, weight_decay: float
+    ) -> list[dict[str, object]]:
+        decay: list[nn.Parameter] = []
+        no_decay: list[nn.Parameter] = []
+
+        def _is_no_decay(name: str, param: nn.Parameter) -> bool:
+            if name.endswith(".bias"):
+                return True
+            if param.ndim == 1:
+                return True
+            if any(key in name for key in ("pos_embed", "mask_token", "cls_token")):
+                return True
+            return False
+
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            if _is_no_decay(name, param):
+                no_decay.append(param)
+            else:
+                decay.append(param)
+
+        decay_elems = sum(p.numel() for p in decay)
+        no_decay_elems = sum(p.numel() for p in no_decay)
+        total_elems = decay_elems + no_decay_elems
+        print(
+            "[startup] AdamW param groups: "
+            f"decay={decay_elems/1e6:.2f}M "
+            f"no_decay={no_decay_elems/1e6:.2f}M "
+            f"total={total_elems/1e6:.2f}M"
+        )
+
+        return [
+            {"name": "decay", "params": decay, "weight_decay": weight_decay},
+            {"name": "no_decay", "params": no_decay, "weight_decay": 0.0},
+        ]
+
+    param_groups = _build_adamw_param_groups(model, weight_decay_start)
 
     # Optimizer with paper-aligned betas
     try:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            param_groups,
             lr=lr,
             betas=betas,  # PAPER: (0.9, 0.95)
-            weight_decay=weight_decay_start,  # Initial value, will be scheduled
             fused=device.type == "cuda",
         )
     except TypeError:
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay_start
+            param_groups, lr=lr, betas=betas
         )
 
     total_steps = max_steps or math.ceil((len(dataloader) * epochs) / grad_accum_steps)
     min_lr_ratio = min_lr / lr
+    print(
+        "[startup] epochs="
+        f"{epochs} steps_per_epoch={len(dataloader)} "
+        f"grad_accum_steps={grad_accum_steps} total_steps={total_steps} "
+        f"warmup_steps={warmup_steps}"
+    )
     
     # Weight decay schedule (paper: cosine from 0.04 → 0.4)
     def get_weight_decay(step: int) -> float:
@@ -401,6 +491,44 @@ def train(
     wandb_run_name = run_name or "salt-training"
     _setup_wandb(project="salt-vla", run_name=wandb_run_name)
 
+    ckpt_run_dir: Path | None = None
+    if checkpoint_dir is not None:
+        ckpt_run_dir = _setup_checkpoint_dir(log_path, checkpoint_dir)
+        print(f"[startup] checkpoints_dir={ckpt_run_dir}")
+
+    best_epoch_loss = float("inf")
+    best_epoch = -1
+    best_step = -1
+
+    train_config: dict[str, object] = {
+        "run_name": run_name,
+        "data_root": str(data_root),
+        "split": split,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "lr": lr,
+        "min_lr": min_lr,
+        "warmup_steps": warmup_steps,
+        "weight_decay_start": weight_decay_start,
+        "weight_decay_end": weight_decay_end,
+        "mask_ratio": mask_ratio,
+        "masking_strategy": masking_strategy,
+        "use_cached_latents": use_cached_latents,
+        "use_dataloader_masks": use_dataloader_masks,
+        "cache_dir": str(cache_dir),
+        "student_model_name": student_model_name,
+        "predictor_dim": predictor_dim,
+        "predictor_depth": predictor_depth,
+        "predictor_num_heads": predictor_num_heads,
+        "tubelet_size": tubelet_size,
+        "patch_size": patch_size,
+        "torch_compile_mode": torch_compile_mode,
+        "dtype": str(model_dtype),
+    }
+    if ckpt_run_dir is not None:
+        (ckpt_run_dir / "config.json").write_text(json.dumps(train_config, indent=2) + "\n")
+
     step = 0
     loader_error_count = 0
     model.train()
@@ -420,12 +548,20 @@ def train(
     last_decode_time = 0.0
     last_gpu_mem_gb = 0.0
     last_gpu_mem_max_gb = 0.0
+    last_gpu_alloc_gb = 0.0
+    last_gpu_alloc_max_gb = 0.0
+
+    epoch_loss_sum = 0.0
+    epoch_mse_sum = 0.0
+    epoch_steps = 0
 
     def apply_optimizer_step() -> bool:
         nonlocal step
         nonlocal accum_steps, accum_loss, accum_mse_loss, accum_var_loss, accum_cov_loss
         nonlocal last_step_time, last_clips_per_sec, last_decode_time
         nonlocal last_gpu_mem_gb, last_gpu_mem_max_gb
+        nonlocal last_gpu_alloc_gb, last_gpu_alloc_max_gb
+        nonlocal epoch_loss_sum, epoch_mse_sum, epoch_steps
 
         if accum_steps == 0:
             return False
@@ -439,7 +575,8 @@ def train(
 
         current_wd = get_weight_decay(step)
         for param_group in optimizer.param_groups:
-            param_group['weight_decay'] = current_wd
+            if param_group.get("name") == "decay":
+                param_group["weight_decay"] = current_wd
 
         avg_loss = accum_loss / accum_steps
         avg_mse_loss = accum_mse_loss / accum_steps
@@ -449,6 +586,11 @@ def train(
         avg_cov_loss = (
             accum_cov_loss / accum_steps if covariance_loss_weight > 0 else 0.0
         )
+
+        # Epoch aggregates (per optimizer step)
+        epoch_loss_sum += avg_loss
+        epoch_mse_sum += avg_mse_loss
+        epoch_steps += 1
 
         accum_steps = 0
         accum_loss = 0.0
@@ -473,11 +615,20 @@ def train(
                 "loss": avg_loss,
                 "mse_loss": avg_mse_loss,
                 "lr": optimizer.param_groups[0]["lr"],
-                "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                "weight_decay": next(
+                    (
+                        pg["weight_decay"]
+                        for pg in optimizer.param_groups
+                        if pg.get("name") == "decay"
+                    ),
+                    0.0,
+                ),
                 "clips_per_sec": last_clips_per_sec,
                 "batch_decode_sec": last_decode_time,
                 "gpu_mem_gb": last_gpu_mem_gb,
                 "gpu_mem_max_gb": last_gpu_mem_max_gb,
+                "gpu_alloc_gb": last_gpu_alloc_gb,
+                "gpu_alloc_max_gb": last_gpu_alloc_max_gb,
                 "system_ram_percent": system_ram_percent,
                 "system_ram_available_gb": system_ram_available_gb,
             }
@@ -491,7 +642,7 @@ def train(
                 "[train] step="
                 f"{step} loss={avg_loss:.4f} clips/s={last_clips_per_sec:.2f} "
                 f"decode_s={last_decode_time:.3f} gpu_mem_gb={last_gpu_mem_gb:.2f} "
-                f"ram={system_ram_percent:.1f}%"
+                f"ram={system_ram_percent:.1f}% gpu_alloc_gb={last_gpu_alloc_gb:.2f}"
             )
 
         step += 1
@@ -577,6 +728,9 @@ def train(
         raise
 
     for epoch in range(epochs):
+        epoch_loss_sum = 0.0
+        epoch_mse_sum = 0.0
+        epoch_steps = 0
         dataloader_iter = iter(dataloader)
         while True:
             fetch_start = time.time()
@@ -710,11 +864,16 @@ def train(
             last_clips_per_sec = videos.shape[0] / max(time.time() - start_time, 1e-6)
             last_decode_time = decode_time
             if device.type == "cuda":
-                last_gpu_mem_gb = torch.cuda.memory_allocated() / (1024**3)
-                last_gpu_mem_max_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                # Report both "reserved" (matches nvidia-smi more closely) and "allocated" (tensors only).
+                last_gpu_mem_gb = torch.cuda.memory_reserved() / (1024**3)
+                last_gpu_mem_max_gb = torch.cuda.max_memory_reserved() / (1024**3)
+                last_gpu_alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+                last_gpu_alloc_max_gb = torch.cuda.max_memory_allocated() / (1024**3)
             else:
                 last_gpu_mem_gb = 0.0
                 last_gpu_mem_max_gb = 0.0
+                last_gpu_alloc_gb = 0.0
+                last_gpu_alloc_max_gb = 0.0
 
             if accum_steps >= grad_accum_steps:
                 if apply_optimizer_step():
@@ -723,6 +882,66 @@ def train(
         if accum_steps > 0:
             if apply_optimizer_step():
                 return
+
+        if epoch_steps > 0:
+            epoch_avg_loss = epoch_loss_sum / epoch_steps
+            epoch_avg_mse = epoch_mse_sum / epoch_steps
+        else:
+            epoch_avg_loss = float("nan")
+            epoch_avg_mse = float("nan")
+
+        logger.info(
+            "[epoch] %d/%d avg_loss=%.4f avg_mse=%.4f steps=%d global_step=%d",
+            epoch + 1,
+            epochs,
+            epoch_avg_loss,
+            epoch_avg_mse,
+            epoch_steps,
+            step,
+        )
+
+        if ckpt_run_dir is not None and save_best_checkpoint:
+            if epoch_avg_loss < best_epoch_loss:
+                best_epoch_loss = float(epoch_avg_loss)
+                best_epoch = epoch + 1
+                best_step = step
+                _save_checkpoint(
+                    path=ckpt_run_dir / "best.pth",
+                    model=model,
+                    step=step,
+                    epoch=epoch + 1,
+                    metrics={
+                        "epoch_avg_loss": epoch_avg_loss,
+                        "epoch_avg_mse": epoch_avg_mse,
+                        "best_epoch": best_epoch,
+                        "best_epoch_loss": best_epoch_loss,
+                    },
+                    config=train_config,
+                )
+                logger.info(
+                    "[checkpoint] best saved: epoch=%d step=%d loss=%.4f path=%s",
+                    best_epoch,
+                    best_step,
+                    best_epoch_loss,
+                    ckpt_run_dir / "best.pth",
+                )
+
+    if ckpt_run_dir is not None and save_last_checkpoint:
+        _save_checkpoint(
+            path=ckpt_run_dir / "last.pth",
+            model=model,
+            step=step,
+            epoch=epochs,
+            metrics={
+                "final_epoch": epochs,
+                "final_step": step,
+                "best_epoch": best_epoch,
+                "best_step": best_step,
+                "best_epoch_loss": best_epoch_loss,
+            },
+            config=train_config,
+        )
+        logger.info("[checkpoint] last saved: path=%s", ckpt_run_dir / "last.pth")
 
 
 if __name__ == "__main__":

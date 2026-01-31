@@ -30,10 +30,25 @@ htmlcov/
 # Experiment/logging outputs
 wandb/
 checkpoints/
+run_logs/
+logs/
+benchmarks/
+.bin/
 *.log
 *.pt
 *.pth
 *.safetensors
+*.ckpt
+
+# Local outputs / data artifacts
+*.npy
+*.npz
+*.pkl
+*.h5
+*.hdf5
+*.lmdb
+*.sqlite
+*.db
 
 # Claude agent artifacts
 .claude/
@@ -48,6 +63,17 @@ checkpoints/
 START_HERE.md
 SUDO_SETUP.md
 run_summary_*.json
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+*.crt
+secrets/
+.secrets/
 
 # Temporary test/iteration scripts
 test_*.py

@@ -1,35 +1,102 @@
 # SALT-VLA Progress Snapshot
-# Last updated: 2026-01-06 (based on archived log)
+# Last updated: 2026-01-13
 
 Goal
-- Train a SoTA ViT-Base vision encoder for VLA using V-JEPA self-supervised learning.
+- Train a strong video encoder backbone for VLA via SALT (frozen teacher, student predicts teacher latents on masked regions).
 
-Current setup
-- Teacher: VideoMAE v1-Huge (Tianjiao-Yu/videomae-huge)
-- Student: ViT-Base patch16 224
-- Predictor: 12-layer transformer (384 dim, 6 heads)
-- Dataset: Something-Something v2
-- Cached latents: /mnt/ssv2/cached_latents_v1huge/train (metadata.json present)
-- DataLoader masking: use_dataloader_masks=True
+Current setup (Stage 2: student training)
+- Teacher targets: cached VideoMAE latents (frozen teacher; no teacher forward pass during training)
+- Cached latents: `/mnt/ssv2/cached_latents_v1huge/train` (metadata.json present; latent_shape=[1568, 768])
+- Dataset: Something-Something v2 (168,903 videos)
+- Student: ViT-Large patch16 224
+- Predictor: 12-layer transformer (predictor_dim=512, heads=8)
+- Masking: multi-block masks from DataLoader (use_dataloader_masks=True)
+
+Most recent completed run
+- Script: `train_vitl_10epoch.py` (10 epochs)
+- RUN_NAME: `vitl_10epoch_v1huge_lr2e4`
+- Log: `run_logs/vitl_10epoch_v1huge_lr2e4_20260107_084240_pid1134145.log`
+- Result: min loss 9.7319 @ step 42800 (~epoch 6.1); end loss 11.1865 (loss rebounded late)
+
+Plateau / rebound diagnosis (most likely)
+- Weight decay schedule (0.04→0.4 cosine) was applied to *all* trainable parameters (including LayerNorm/bias/pos_embed/mask_token), which is known to destabilize ViT training and can cause late-training loss rebound.
+
+Fixes implemented (2026-01-09)
+- `src/train.py`: AdamW now uses param groups so weight decay applies only to “decay” params; “no_decay” params (biases, 1D params like norms, pos_embed, cls_token, mask_token) stay at 0 WD.
+- `src/models/salt.py` + `src/train.py`: true cached-latents mode now skips loading the teacher model entirely (`load_teacher=False`) and infers teacher_dim from cache metadata.
+
+Current blockers
+- GPU telemetry/CUDA can appear “down” inside sandboxed agent processes (seccomp / `NoNewPrivs=1`), even when the host shell is fine.
+  - Verify from any shell: `cat /proc/self/status | rg -n "NoNewPrivs|Seccomp"`.
+  - In full-access mode (`NoNewPrivs=0`, `Seccomp=0`), NVML/CUDA work normally.
+  - See `docs/nvidia-modprobe.md` for the checklist (includes the sandbox case).
 
 Most recent run (completed)
-- Script: train_vitb_exp1_higherlr_vicreg10.py (10 epochs)
-- RUN_NAME: vitb_exp1_higherlr_vicreg10_v1huge
-- Log: /home/derekszen/Projects/SALT-VLA/run_logs/vitb_exp1_higherlr_vicreg10_v1huge_20260106_165129_pid1197207.log
-- WandB: c1sk8d6s (local dir: /home/derekszen/Projects/SALT-VLA/wandb/run-20260106_165135-c1sk8d6s)
-- Result: min loss 10.6725 @ step 46160; last logged step 52760, last loss 11.6332
-- Exit: 2026-01-06 19:11:55 [INFO] Process exiting (no traceback)
+- Script: `train_vitl_10epoch.py` (10 epochs)
+- RUN_NAME: `vitl_10epoch_wdgroups_lr2e4_bgtest`
+- Log: `run_logs/vitl_10epoch_wdgroups_lr2e4_bgtest_20260109_154049_pid1618342.log`
+- Result: min loss 9.7144 @ step 69080; last logged 10.0499 @ step 70360; **no big late rebound** (major improvement vs prior ViT-L 10-epoch).
 
-Best results so far
-- Higher LR (3e-4) achieved min loss ~10.40 (pre v1-huge cache run).
-- v1-huge 3-epoch run best loss ~10.50, last-100 avg ~11.575 (plateau).
+Latest completed run (20 epochs)
+- Script: `train_vitl_10epoch.py` (EPOCHS=20)
+- RUN_NAME: `vitl_20epoch_wdgroups_lr2e4_bgtest`
+- Log: `run_logs/vitl_20epoch_wdgroups_lr2e4_bgtest_20260112_093316_pid159186.log`
+- Result: epoch-20 avg loss 10.1201; per-step loss dips to ~9.56 late in training; still not clearly better than 10-epoch baseline.
 
-Recent changes
-- Teacher switched to VideoMAE v1-Huge; cache rebuilt in /mnt/ssv2/cached_latents_v1huge.
-- DataLoader now emits multi-block masks; legacy loader kept at src/data/loader_legacy.py.
-- Run-level logging added to src/train.py (run_logs/ with signal handlers).
+Latest completed run (short sanity)
+- Script: `train_vitl_10epoch.py` (EPOCHS=3)
+- RUN_NAME: `vitl_3epoch_lr3e4_minlr3e5_clip0p1`
+- Log: `run_logs/vitl_3epoch_lr3e4_minlr3e5_clip0p1_20260113_143503_pid3853516.log`
+- Result: epoch-3 avg loss 11.3528 (LR=3e-4, min_lr=3e-5, grad_clip=0.1). Intended to check early slope with looser schedule.
 
-Next steps
-- Decide next run: tune VICReg weights (variance/covariance) or try combined LR + mask_ratio=0.9.
-- Run from /mnt/Projects/SALT-VLA to keep logs in this repo copy (current run logs are under /home/derekszen/Projects/SALT-VLA).
-- Keep target loss <10.0 for publication.
+Dataset split sanity (SSv2)
+- Training uses `split=train` → `/mnt/ssv2/train.json` (168,913 entries; includes labels/templates but we ignore them for SSL).
+- `/mnt/ssv2/test.json` is unlabeled (IDs only; 27,157 entries). We are **not** training on test.
+- Validation list exists in-repo at `ssv2/validation.json` and can be used by setting `split=validation` (loader falls back to repo split JSONs when missing from `/mnt/ssv2`).
+
+Remaining root issues / likely causes of “plateau”
+- The big instability/rebound root cause (WD on norms/bias/pos/mask tokens) is fixed; training no longer blows up late.
+- Loss is still improving slowly late in training (best at step 69080), suggesting we may simply be under-trained (more epochs) and/or overly regularized late (WD schedule end too high for 10-epoch runs).
+- We previously had **no checkpoints** and **no validation metric**, so we could not: (a) reuse the best weights, (b) tune hyperparams against a held-out split, or (c) connect distillation loss to downstream usefulness for VLA.
+
+Fixes added (2026-01-10)
+- `src/train.py`: save student/predictor checkpoints (no teacher) to `checkpoints/<run_log_stem>/{best.pth,last.pth}`.
+- `train_vitl_10epoch.py`: allow env overrides for `EPOCHS`, `WEIGHT_DECAY_{START,END}`, and predictor config.
+- `eval_distill_loss.py`: evaluate masked-latent MSE on `split=validation` (teacher on-the-fly) for any saved checkpoint.
+
+Next steps (after this run)
+- Given the rebound is largely fixed, focus on lowering the floor: tune `weight_decay_end` (try 0.2), and/or add light VICReg variance/covariance penalties for ViT-L.
+- If we want a direct A/B: rerun ViT-L 10-epoch with identical hyperparams except `weight_decay_end` and compare (min + last-2k-step avg).
+  - After any run that saves checkpoints: run `PYTHONPATH=. ./.venv/bin/python eval_distill_loss.py --checkpoint checkpoints/<run>/best.pth --split validation --max-batches 200`.
+  - If val MSE improves but downstream (linear probe / robotics) does not, the issue is objective ↔ downstream mismatch, not “plateau”.
+
+Queued / running next experiment
+- RUN_NAME: `vitl_10epoch_wdgroups_lr2e4_wdend0p2`
+- Change: `weight_decay_end=0.2` (everything else held constant)
+- PID: 3763572
+- Log: `run_logs/vitl_10epoch_wdgroups_lr2e4_wdend0p2_20260110_115453_pid3763572.log`
+
+Fast “physics-ish” sanity benchmark (SSv2 time-arrow probe)
+- Added: `bench_time_arrow_ssv2.py` (linear probe to classify forward vs time-reversed clips from frozen student embeddings).
+- Why: cheap check that representations encode temporal directionality (often correlates with motion/physics sensitivity).
+- Manual run (after checkpoints exist):
+  - `.venv/bin/python bench_time_arrow_ssv2.py --checkpoint checkpoints/<run_log_stem>/best.pth --train-videos 2000 --val-videos 1000 --out benchmarks/time_arrow/<run_log_stem>.json`
+- Auto-run helper:
+  - `scripts/queue_time_arrow_after_run.py` waits for a log to finish (looks for “Process exiting.”) then runs the probe.
+  - Currently queued via systemd: `salt-time-arrow-wdend0p2.service` (will write to `benchmarks/time_arrow/` after the current training run exits).
+
+Most recent run (completed)
+- Script: `train_vitl_10epoch.py` (10 epochs)
+- RUN_NAME: `vitl_10epoch_wdgroups_lr2e4_wdend0p2`
+- Log: `run_logs/vitl_10epoch_wdgroups_lr2e4_wdend0p2_20260110_115453_pid3763572.log`
+- Result: epoch avg loss 10.7203 at epoch 10; best checkpoint saved at epoch 10 (per epoch-avg criterion).
+- A/B note: this was worse than the prior `wdgroups_lr2e4_bgtest` run (min 9.7144), so lowering `weight_decay_end` to 0.2 did not help.
+
+Next experiment (short sanity)
+- Hypothesis: schedule/regularization too conservative (LR/min_lr/grad_clip), not just length.
+- Plan: 3-epoch ViT-L run with higher LR + higher min_lr + looser grad clip, compare early slope vs 20-epoch baseline.
+
+Probe/infra blockers discovered
+- Auto time-arrow probe via systemd hit OOM and was killed (memory cap + multiproc workers).
+- Running probes/tests in this agent lacks GPU access and blocks multiprocessing semaphores (PermissionError). For full GPU probes, run from a normal shell or a systemd-run job without MemoryMax and with low workers.
+- eval_distill_loss in agent failed to fetch the teacher from Hugging Face (proxy blocked) and hit multiprocessing semaphore permission errors; run from a normal shell with GPU + network.

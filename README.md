@@ -1,34 +1,54 @@
-# ST-JEPA (SALT-style) -- VideoMAE-H teacher targets
+# ST-JEPA (SALT-Style) Video Pretraining
 
-This repo implements a hybrid ST-Transformer student that predicts frozen VideoMAE-H latents cached from SSv2.
-See `AGENTS.md` for full constraints and milestone criteria.
+Train a hybrid ST-Transformer student to predict frozen VideoMAE-H teacher latents cached from SSv2.
+Teacher never runs during student training; training reads cached targets only.
 
-## Environment (M0)
+## Architecture (short)
+- **Teacher**: VideoMAE-H (`MCG-NJU/videomae-huge-finetuned-kinetics`), frozen
+- **Targets**: cached float16 `[N, 384]` tokens (drop CLS)
+- **Student**: D=384, 12 blocks (first 8 factorized T→S, last 4 joint)
+- **Masking**: tube masking (shared spatial mask across time)
+- **Loss**: cosine on masked tokens only
+
+## Minimum hardware
+- **Linux**
+- **GPU**: 1x NVIDIA GPU (>= 16GB VRAM recommended)
+- **Disk**: enough for SSv2 + cache (hundreds of GB for full set)
+
+## Setup (Linux)
 ```bash
 uv venv .venv
 uv pip install -r requirements.txt --python .venv/bin/python
-
-.venv/bin/python -c "import torch; print(torch.cuda.is_available())"
-.venv/bin/python -c "import transformers, einops, decord; print('ok')"
 ```
 
-## Build a small SSv2 cache (M3) -- 1k samples
+## Build a small cache (optional, 1k samples)
 ```bash
 ./scripts/build_cache_ssv2.sh /mnt/ssv2 /mnt/ssv2/cache_videomae_huge_384 1000
 ```
 
-## Overfit test (M5) -- 32 clips, 200 iters
+## Run a 4-epoch pretrain (cached targets)
 ```bash
-./scripts/pretrain_ssv2.sh /mnt/ssv2 /mnt/ssv2/cache_videomae_huge_384 --overfit
+./scripts/pretrain_ssv2.sh /mnt/ssv2 /mnt/ssv2/cache_videomae_huge_384
 ```
 
-## Tests
+## Simplest UCF-101 inference (linear probe)
+```bash
+./scripts/ucf101_infer.sh /mnt/ucf101 checkpoints/checkpoint_step0.pt
+```
+
+## Tests (quick)
 ```bash
 make test
 # or
 .venv/bin/python -m pytest
 ```
 
-## Notes
-- SSv2 must be downloaded from Qualcomm. Do not use unofficial mirrors.
-- Teacher is never run during training; only the cached targets are used.
+What tests cover (brief):
+- **SSv2 dataloader**: deterministic frame sampling and tensor shapes
+- **Teacher wrapper**: VideoMAE-H token/projection shapes
+- **Cache format**: zarr roundtrip is byte-exact
+- **Student model**: output shape + finite values
+
+Notes:
+- UCF-101 data must be prepared under `/mnt/ucf101` with `ucfTrainTestlist/`.
+- If SSv2 or UCF-101 are not present, download from official sources only.

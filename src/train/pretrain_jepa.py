@@ -76,6 +76,11 @@ def main() -> None:
         sample_mode="random",
     )
     dataset = SSV2CachedDataset(ssv2_cfg, cache_dir=args.cache_dir)
+    # Clamp dataset length to available cache size.
+    cache_len = dataset.cache.shape[0]
+    if len(dataset) > cache_len:
+        dataset.video_ids = dataset.video_ids[:cache_len]
+        dataset.items = dataset.items[:cache_len]
     if args.overfit:
         dataset.video_ids = dataset.video_ids[: args.overfit_samples]
         dataset.items = dataset.items[: args.overfit_samples]

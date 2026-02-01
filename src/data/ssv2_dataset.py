@@ -130,6 +130,13 @@ class SSV2CachedDataset(SSV2Dataset):
                 f"Cache meta.jsonl not found or empty in: {cache_dir}. Rebuild the cache."
             )
 
+        # Phase-1 correctness gate: require cache to declare the view pipeline.
+        for required in ("transform_hash", "view_hash"):
+            if required not in self.cache_meta:
+                raise ValueError(
+                    f"Cache meta.json missing '{required}' in {cache_dir}; rebuild the cache with this code."
+                )
+
         expected_transform_hash = transform_hash(self.config.view.transform)
         expected_view_hash = view_hash(self.config.view)
         cache_transform_hash = self.cache_meta.get("transform_hash")
@@ -148,6 +155,13 @@ class SSV2CachedDataset(SSV2Dataset):
         self.video_id_to_cache_row: dict[str, int] = {}
         self.video_id_to_meta: dict[str, dict[str, Any]] = {}
         for row in self.meta_rows:
+            # Phase-1 correctness gate: require per-sample view meta.
+            required_keys = ("video_id", "sample_seed", "frame_indices", "transform_hash", "view_hash")
+            missing = [k for k in required_keys if k not in row]
+            if missing:
+                raise ValueError(
+                    f"Cache meta.jsonl row missing keys {missing} in {cache_dir}; rebuild the cache."
+                )
             vid = str(row.get("video_id"))
             if not vid:
                 continue

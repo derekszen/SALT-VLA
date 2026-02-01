@@ -4,4 +4,4 @@ test:
 	.venv/bin/python -m pytest
 
 phase-a:
-	./scripts/phase_a_smoke.sh
+	bash scripts/phase_a_smoke.sh

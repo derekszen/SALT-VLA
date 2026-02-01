@@ -56,6 +56,8 @@ Phase 1 verifies the cache-time and train-time video view is locked per clip id 
 ## Run Phase 1 smoke test
 ```bash
 make phase-a
+# or:
+# bash scripts/phase_a_smoke.sh
 ```
 
 ## Run a 4-epoch pretrain

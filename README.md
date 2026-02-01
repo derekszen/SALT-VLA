@@ -40,6 +40,9 @@ MSR-VTT and MSVD:
 - **Masking**: tube masking (shared spatial mask across time)
 - **Loss**: cosine on masked tokens only
 
+## Phase 1 gate
+Phase 1 verifies the cache-time and train-time video view is locked per clip id and that a 32-clip overfit run drops cosine loss by at least 30% within 200 steps.
+
 ## Minimum hardware
 - **Linux**
 - **GPU**: 1x NVIDIA GPU (>= 16GB VRAM recommended)
@@ -48,6 +51,11 @@ MSR-VTT and MSVD:
 ## Build a small cache
 ```bash
 ./scripts/build_cache_ssv2.sh /mnt/ssv2 /mnt/ssv2/cache_videomae_huge_384 1000
+```
+
+## Run Phase 1 smoke test
+```bash
+make phase-a
 ```
 
 ## Run a 4-epoch pretrain
@@ -74,6 +82,7 @@ make test
 
 What tests cover and why they pass:
 - **SSv2 dataloader**: deterministic frame sampling and tensor shapes on a tiny synthetic video
+- **Cache view lock**: cache meta uses video_id->row mapping and hard-fails if cache view hash mismatches training
 - **Teacher wrapper**: VideoMAE-H token/projection shapes, deterministic projection
 - **Cache format**: zarr roundtrip is byte-exact for float16
 - **Student model**: output shape and finite values for random input

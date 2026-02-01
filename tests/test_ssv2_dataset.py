@@ -8,6 +8,7 @@ import cv2
 import torch
 
 from src.data.ssv2_dataset import SSV2Config, SSV2Dataset
+from src.data.view import VideoViewConfig
 
 
 def _write_dummy_video(path: Path, num_frames: int = 20, size: int = 64) -> None:
@@ -24,26 +25,25 @@ def test_ssv2_dataset_deterministic_sampling(tmp_path: Path) -> None:
     data_root = tmp_path / "ssv2"
     data_root.mkdir(parents=True)
 
-    video_id = "123"
-    video_path = data_root / f"{video_id}.mp4"
-    _write_dummy_video(video_path, num_frames=24, size=64)
+    video_id_a = "123"
+    video_id_b = "124"
+    _write_dummy_video(data_root / f"{video_id_a}.mp4", num_frames=24, size=64)
+    _write_dummy_video(data_root / f"{video_id_b}.mp4", num_frames=24, size=64)
 
-    split_path = data_root / "train.json"
-    with split_path.open("w") as f:
-        json.dump([{"id": video_id}], f)
+    split_path_1 = data_root / "train_1.json"
+    with split_path_1.open("w") as f:
+        json.dump([{"id": video_id_a}, {"id": video_id_b}], f)
 
-    config = SSV2Config(
-        data_root=data_root,
-        split="train",
-        num_frames=16,
-        seed=123,
-        sample_mode="random",
-    )
-    ds1 = SSV2Dataset(config)
-    ds2 = SSV2Dataset(config)
+    split_path_2 = data_root / "train_2.json"
+    with split_path_2.open("w") as f:
+        json.dump([{"id": video_id_b}, {"id": video_id_a}], f)
+
+    view_cfg = VideoViewConfig(num_frames=16, sample_mode="random", seed_base=123)
+    ds1 = SSV2Dataset(SSV2Config(data_root=data_root, split="train", view=view_cfg, split_path=split_path_1))
+    ds2 = SSV2Dataset(SSV2Config(data_root=data_root, split="train", view=view_cfg, split_path=split_path_2))
 
     vid1 = ds1[0]
-    vid2 = ds2[0]
+    vid2 = ds2[1]
 
     assert vid1.shape == (3, 16, 224, 224)
     assert torch.allclose(vid1, vid2), "Deterministic sampling failed"

@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from src.data.ssv2_dataset import SSV2Config, SSV2CachedDataset
+from src.data.view import VideoViewConfig
 from src.models.st_videomae_student import StudentConfig, STVideoMAEStudent
 from src.models.predictor import PredictorConfig, JEPAPredictor
 from src.train.optim import build_optimizer
@@ -46,6 +47,7 @@ def main() -> None:
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -68,19 +70,13 @@ def main() -> None:
             f"Cache dir not found: {args.cache_dir}. Build it with scripts/build_cache_ssv2.sh"
         )
 
+    view_cfg = VideoViewConfig(num_frames=16, sample_mode="random", seed_base=args.seed)
     ssv2_cfg = SSV2Config(
         data_root=args.data_root,
         split=args.split,
-        num_frames=16,
-        seed=0,
-        sample_mode="random",
+        view=view_cfg,
     )
     dataset = SSV2CachedDataset(ssv2_cfg, cache_dir=args.cache_dir)
-    # Clamp dataset length to available cache size.
-    cache_len = dataset.cache.shape[0]
-    if len(dataset) > cache_len:
-        dataset.video_ids = dataset.video_ids[:cache_len]
-        dataset.items = dataset.items[:cache_len]
     if args.overfit:
         dataset.video_ids = dataset.video_ids[: args.overfit_samples]
         dataset.items = dataset.items[: args.overfit_samples]

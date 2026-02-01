@@ -1,29 +1,26 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.data.video_decode import decode_video, get_video_length, sample_frame_indices
-from src.data.transforms import VideoTransformConfig, apply_video_transform
+from src.data.transforms import transform_hash
+from src.data.view import VideoViewConfig, build_view, view_hash
 
 
 @dataclass(frozen=True)
 class SSV2Config:
     data_root: Path
     split: str = "train"
-    num_frames: int = 16
-    sample_mode: str = "random"
-    seed: int = 0
-    transform: VideoTransformConfig = VideoTransformConfig()
+    view: VideoViewConfig = field(default_factory=VideoViewConfig)
     video_extensions: tuple[str, ...] = (".webm", ".mp4")
     video_dir: Path | None = None
     split_path: Path | None = None
+    return_meta: bool = False
 
 
 class SSV2Dataset(Dataset):
@@ -107,35 +104,80 @@ class SSV2Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
         video_id = self.video_ids[index]
         video_path = self._resolve_video_path(video_id)
-
-        total_frames = get_video_length(video_path)
-        seed = int(self.config.seed) + int(index)
-        frame_indices = sample_frame_indices(
-            num_frames=self.config.num_frames,
-            total_frames=total_frames,
-            seed=seed,
-            mode=self.config.sample_mode,
-        )
-
-        frames = decode_video(video_path, frame_indices)
-        video = apply_video_transform(frames, self.config.transform)
+        video, meta = build_view(video_path, video_id, self.config.view)
+        if self.config.return_meta:
+            return video, meta
         return video
 
 
 class SSV2CachedDataset(SSV2Dataset):
-    \"\"\"SSV2 dataset that returns cached teacher targets alongside video.\"\"\"
+    """SSV2 dataset that returns cached teacher targets alongside video."""
 
     def __init__(self, config: SSV2Config, cache_dir: Path) -> None:
         super().__init__(config)
-        from src.cache.cache_format import open_cache
+        from src.cache.cache_format import open_cache, read_cache_meta, read_meta_jsonl
 
         self.cache_dir = cache_dir
         self.cache = open_cache(cache_dir)
+        self.cache_meta = read_cache_meta(cache_dir)
+        self.meta_rows = read_meta_jsonl(cache_dir)
+
+        if not self.meta_rows:
+            raise FileNotFoundError(
+                f"Cache meta.jsonl not found or empty in: {cache_dir}. Rebuild the cache."
+            )
+
+        expected_transform_hash = transform_hash(self.config.view.transform)
+        expected_view_hash = view_hash(self.config.view)
+        cache_transform_hash = self.cache_meta.get("transform_hash")
+        cache_view_hash = self.cache_meta.get("view_hash")
+        if cache_transform_hash is not None and cache_transform_hash != expected_transform_hash:
+            raise ValueError(
+                "Transform mismatch between training and cache. "
+                f"expected={expected_transform_hash} cache={cache_transform_hash}"
+            )
+        if cache_view_hash is not None and cache_view_hash != expected_view_hash:
+            raise ValueError(
+                "View pipeline mismatch between training and cache. "
+                f"expected={expected_view_hash} cache={cache_view_hash}"
+            )
+
+        self.video_id_to_cache_row: dict[str, int] = {}
+        self.video_id_to_meta: dict[str, dict[str, Any]] = {}
+        for row in self.meta_rows:
+            vid = str(row.get("video_id"))
+            if not vid:
+                continue
+            cache_row = row.get("index", row.get("cache_row"))
+            if cache_row is None:
+                continue
+            self.video_id_to_cache_row[vid] = int(cache_row)
+            self.video_id_to_meta[vid] = row
+
+        # Filter dataset to only clip ids present in the cache mapping.
+        keep = [i for i, vid in enumerate(self.video_ids) if vid in self.video_id_to_cache_row]
+        self.items = [self.items[i] for i in keep]
+        self.video_ids = [self.video_ids[i] for i in keep]
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        video = super().__getitem__(index)
-        target = torch.from_numpy(self.cache[index])
+        video_id = self.video_ids[index]
+        video_path = self._resolve_video_path(video_id)
+        video, meta = build_view(video_path, video_id, self.config.view)
+
+        cache_meta = self.video_id_to_meta.get(video_id)
+        if cache_meta is None:
+            raise KeyError(f"video_id missing in cache meta: {video_id}")
+
+        for key in ("transform_hash", "view_hash", "sample_seed", "frame_indices"):
+            if key in cache_meta and meta.get(key) != cache_meta.get(key):
+                raise ValueError(
+                    f"Cache mismatch for video_id={video_id} key={key}: "
+                    f"train={meta.get(key)} cache={cache_meta.get(key)}"
+                )
+
+        cache_row = self.video_id_to_cache_row[video_id]
+        target = torch.from_numpy(self.cache[cache_row])
         return video, target

@@ -36,3 +36,10 @@ known-first-party = ["SALT-VLA"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = [
+    "test_ssv2_dataset.py",
+    "test_view_cache_lock.py",
+    "test_shapes_teacher.py",
+    "test_shapes_student.py",
+    "test_cache_roundtrip.py",
+]

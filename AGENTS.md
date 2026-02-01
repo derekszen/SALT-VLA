@@ -186,6 +186,14 @@ PASS when:
 
 ---
 
+## Ops notes
+- SSv2 expected at `/mnt/ssv2` for fastest local IO.
+- Dataloader stability: use `pin_memory=True`, `prefetch_factor=2`, and `num_workers` in the 8--12 range on 16-core CPUs.
+- If workers crash with `terminate called without an active exception`, prefer `forkserver` multiprocessing context.
+- Preflight sanity: run a single batch and verify shape `(B, 3, 16, 224, 224)` before long runs.
+
+---
+
 ## Notes on "zero-shot" claims
 This pipeline is video-only pretraining. True zero-shot video<->text requires some video-text alignment stage.
 Agent: implement retrieval eval as:

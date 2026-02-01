@@ -49,6 +49,31 @@ What tests cover (brief):
 - **Cache format**: zarr roundtrip is byte-exact
 - **Student model**: output shape + finite values
 
+## Dataset download instructions
+SSv2:
+- Official Qualcomm portal only:
+  https://www.qualcomm.com/developer/software/something-something-v-2-dataset/downloads
+- Place data under `/mnt/ssv2` with `train.json`, `validation.json`, `test.json` and video files like `12345.webm`.\n
+UCF-101:
+- Official UCF CRCV page:
+  https://www.crcv.ucf.edu/data/UCF101.php
+- Place data under `/mnt/ucf101` and extract `ucfTrainTestlist/` there.
+
+MSR-VTT and MSVD:
+- Videos zips can be pulled from Hugging Face:
+  https://huggingface.co/datasets/friedrichor/MSR-VTT/resolve/main/MSRVTT_Videos.zip
+  https://huggingface.co/datasets/friedrichor/MSVD/resolve/main/MSVD_Videos.zip
+
+## Quick benchmarks
+- UCF-101 linear probe:
+  ```bash
+  ./scripts/ucf101_infer.sh /mnt/ucf101 checkpoints/checkpoint_step0.pt
+  ```
+- Retrieval eval (MSR-VTT/MSVD):
+  ```bash
+  ./scripts/eval_retrieval.sh /mnt/msrvtt /mnt/msvd checkpoints/checkpoint_step0.pt
+  ```
+
 Notes:
 - SSv2 download must use the official Qualcomm portal. Do not use unofficial mirrors.
 - If you are in Beijing or mainland China and downloads are slow, use the official Qualcomm portal via a stable network or VPN allowed by your institution. Avoid third-party mirrors.

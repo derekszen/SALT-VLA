@@ -4,6 +4,7 @@ Train a hybrid ST-Transformer student to predict frozen VideoMAE-H teacher laten
 Teacher never runs during student training; training reads cached targets only.
 
 ## Project goals and innovations
+- **Goal**: learn as much as possible about spatiotemporal transformers and modern attention mechanisms by building and stress-testing a correct, minimal ST-JEPA pipeline.
 - **Goal**: build a strong video encoder via JEPA-style latent prediction with a frozen teacher and cached targets.
 - **Innovation**: hybrid attention student (factorized early, joint tail) with tube masking and cache-only training for speed and stability.
 

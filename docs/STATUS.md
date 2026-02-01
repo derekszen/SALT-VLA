@@ -1,46 +1,22 @@
 # SALT-VLA Status
 
-Last updated: 2026-01-09
+Last updated: 2026-02-01
 
 Project goal
-- Train a video encoder backbone for VLA via SALT: frozen teacher targets + masked latent prediction (no EMA teacher updates).
+- Train a hybrid ST-Transformer student to predict frozen VideoMAE-H teacher latents (cached) on SSv2, then evaluate with lightweight probes.
 
-Current architecture (Stage 2 / student training)
-- Teacher targets: cached VideoMAE latents (`/mnt/ssv2/cached_latents_v1huge`, latent_shape=[1568, 768])
-- Student: ViT-Large patch16 224
-- Predictor: 12-layer transformer (predictor_dim=512, heads=8)
-- Loss: MSE on masked teacher latents (optional VICReg-style variance/cov penalties)
-- Masking: multi-block masks generated in the DataLoader (use_dataloader_masks=True)
+Current architecture
+- Teacher: HF VideoMAE-H, CLS dropped, cached targets projected 1280->384.
+- Cache: zarr float16 targets [N=1568, D=384] + meta.jsonl mapping.
+- Student: D=384, depth=12, heads=6; 8 factorized + 4 joint blocks; 4-layer predictor.
+- Masking: tube masking over spatial indices shared across time.
+- Loss: cosine on masked tokens only.
 
-Latest completed run
-- Script: `train_vitl_10epoch.py` (10 epochs)
-- RUN_NAME: `vitl_10epoch_v1huge_lr2e4`
-- Log: `run_logs/vitl_10epoch_v1huge_lr2e4_20260107_084240_pid1134145.log`
-- Result: min loss 9.7319 @ step 42800, but late-training rebound (end loss 11.1865)
+Implementation status
+- Core modules, scripts, configs, and tests are implemented.
+- M0–M4 are covered by unit tests.
+- M5–M7 scripts exist but require full-data runs to validate.
 
-Most likely cause of rebound
-- Weight decay schedule was being applied to all trainable params (including norms/bias/pos/mask tokens). This is a common ViT gotcha and can degrade late-training behavior.
-
-Fixes landed
-- `src/train.py`: AdamW param groups now exclude bias/norm/pos_embed/mask_token/cls_token from weight decay; only “decay” params follow the WD schedule.
-- `src/models/salt.py` + `src/train.py`: cached-latents mode now skips teacher loading (`load_teacher=False`) and infers teacher_dim from cache metadata.
-
-Compute note
-- NVML/CUDA can fail inside sandboxed processes (seccomp / `NoNewPrivs=1`) even when they work in a normal shell. See `docs/nvidia-modprobe.md`.
-
-Most recent run
-- RUN_NAME: `vitl_10epoch_wdgroups_lr2e4_bgtest`
-- Log: `run_logs/vitl_10epoch_wdgroups_lr2e4_bgtest_20260109_154049_pid1618342.log`
-- Result: min loss 9.7144 @ step 69080; last logged 10.0499 @ step 70360; rebound largely gone vs prior ViT-L 10-epoch.
-
-## 2026-01-12 - ViT-L 20-epoch follow-up
-
-**Context:** Extend the best 10-epoch WD-group run to 20 epochs to test whether length alone lowers the loss floor.  
-**Issue:** Epoch-20 avg loss (10.1201) and per-step lows (~9.56) are not clearly better than the 10-epoch baseline.  
-**Solution:** Test schedule/regularization loosened (raise LR/min_lr and relax grad clip) on a short run before committing to longer training.
-
-## 2026-01-13 - ViT-L 3-epoch schedule sanity
-
-**Context:** Short A/B to test a looser schedule (LR/min_lr up, grad clip relaxed) before committing to long runs.  
-**Issue:** 3-epoch avg loss 11.3528; needs validation/probe checks to judge early slope vs baseline.  
-**Solution:** Run `scripts/eval_distill_loss.py` + temporal probe suite from a normal shell (GPU + network). The agent sandbox blocks HF downloads and multiprocessing semaphores.
+Operational notes
+- SSv2 expected at /mnt/ssv2; cache default at /mnt/ssv2/cache_videomae_huge_384.
+- Use scripts/ for cache build, pretrain, and eval entrypoints.

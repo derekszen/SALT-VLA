@@ -1,33 +1,29 @@
 # SALT-VLA Operations
 
 Quick start
-- Safety check: PYTHONPATH=. ./.venv/bin/python scripts/safety_test.py
-- Training (cached latents): PYTHONPATH=. ./.venv/bin/python scripts/train.py --use-cached-latents 1 --cache-dir /mnt/ssv2/cached_latents_v1huge
-  - Hybrid ST (dense mask tokens): PYTHONPATH=. ./.venv/bin/python scripts/train.py --use-cached-latents 1 --use-predictor 0 --student-space-time-blocks 9
-- Training (non-cached): PYTHONPATH=. ./.venv/bin/python scripts/train.py --use-cached-latents 0
+- Create venv and install deps (uv):
+  - uv venv .venv
+  - uv pip install -r requirements.txt --python .venv/bin/python
+- Verify environment (M0):
+  - .venv/bin/python -c "import torch; print(torch.cuda.is_available())"
+  - .venv/bin/python -c "import transformers, einops, decord"
 
-Caching latents (VideoMAE v1-Huge)
-- Cache train split:
-  PYTHONPATH=. ./.venv/bin/python scripts/cache_teacher_latents.py --split train --cache_dir /mnt/ssv2/cached_latents_v1huge
-- Dataset integrity test:
-  PYTHONPATH=. ./.venv/bin/python -m pytest tests/test_cached_dataset_integrity.py -v
+Cache build (SSv2)
+- Build a 1k-sample cache shard:
+  - ./scripts/build_cache_ssv2.sh
+- Config defaults in configs/cache_ssv2.yaml (cache_dir, split, limit, batch_size).
 
-Monitoring
-- Health check:
-  ./.venv/bin/python scripts/check_training_health.py <log_file>
-- Save run summary:
-  ./.venv/bin/python scripts/check_training_health.py <log_file> > run_summary_$(date +%Y%m%d_%H%M%S).json
-- Find active runs:
-  ps aux | rg -i "src/train\.py|train_.*\.py"
+Pretraining
+- Single-GPU pretrain:
+  - ./scripts/pretrain_ssv2.sh
+- DDP (example):
+  - torchrun --nproc_per_node=8 src/train/pretrain_jepa.py --config configs/pretrain_ssv2.yaml
 
-Run logging (recommended)
-- Use RUN_NAME and RUN_LOG_DIR to capture stdout/stderr in run_logs/.
-- Example detached launch:
-  RUN_NAME=vitb_exp1_higherlr_vicreg10_v1huge \
-  RUN_LOG_DIR=run_logs \
-  setsid -f env PYTHONPATH=. ./.venv/bin/python src/train.py > /tmp/setsid_train.log 2>&1 &
+Evaluation
+- UCF101 linear probe:
+  - ./scripts/eval_ucf101.sh
+- Retrieval (MSR-VTT/MSVD):
+  - ./scripts/eval_retrieval.sh
 
-DataLoader masking
-- Mask generation moved into DataLoader via masked dataset classes.
-- Use use_dataloader_masks=True for loader-provided masks.
-- Rollback: set use_dataloader_masks=False or use src/data/loader_legacy.py.
+Logging
+- Training logs are written to stdout and JSONL in the run directory.

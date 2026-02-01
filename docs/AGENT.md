@@ -1,22 +1,15 @@
 # Agent Notes
 
-Training health check
-- Command: python check_training_health.py <log_file>
-- Exit codes: 0 healthy, 1 warning, 2 error
-- Key fields: status, recommendation, issues, progress, loss, performance
+Health checks
+- Verify a single batch shape before long runs:
+  - PYTHONPATH=. ./.venv/bin/python -c "from src.data.ssv2_dataset import SSV2Dataset; d=SSV2Dataset('/mnt/ssv2'); v,_=d[0]; print(v.shape)"
 
-Suggested decision logic
-- healthy: continue
-- warning: investigate but continue
-- error: recommend cancel
+Find active runs
+- ps aux | rg -i "pretrain_jepa|build_teacher_cache|eval_ucf101|retrieval_msrvt"
 
-Find logs and processes
-- Active runs: ps aux | rg -i "train_.*\.py"
-- Recent task logs: ls -lt /tmp/claude/-home-derekszen-Projects-SALT-VLA/tasks/*.output | head -5
-- Run logs (preferred): run_logs/
+Logs
+- Training logs: stdout + JSONL in the run directory.
 
-Queueing
-- queue_training.py can chain runs; check its status output for next steps.
-
-Save metrics snapshot
-- python check_training_health.py <log_file> > run_summary_$(date +%Y%m%d_%H%M%S).json
+Common debug
+- If cache build fails, confirm SSv2 path and annotation JSONs exist in /mnt/ssv2.
+- If teacher download fails, confirm Hugging Face access and cached models.

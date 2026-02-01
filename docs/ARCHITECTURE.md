@@ -8,6 +8,7 @@ For full constraints and milestone criteria, see `AGENTS.md`.
 - Tubelet embedding: Conv3D with kernel=(2,16,16), stride=(2,16,16), producing N=1568 tokens (no CLS).
 - Teacher: VideoMAE-H (D_teacher=1280), frozen.
 - Cached targets: float16, shape [N, 384], written once and reused during training.
+- View lock: cache-time and train-time decoding/sampling/transforms are deterministic per clip id; cache stores frame_indices + hashes and training hard-fails on mismatch.
 - Student: D=384, depth=12, heads=6; hybrid attention (8 factorized + 4 joint).
 - Masking: tube masking over spatial indices, shared across time.
 - Loss: cosine on masked tokens only.

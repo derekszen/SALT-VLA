@@ -13,6 +13,8 @@ Train a hybrid ST-Transformer student (factorized early + joint tail) to predict
 3) Use tube masking over spatial indices for v1.
    - Avoid variable per-frame visible counts (no irregular masking in v1).
 4) Cache teacher targets to disk (float16) and NEVER run teacher during student training.
+5) Lock the video view pipeline by clip id.
+   - Derive sampling seed as `seed_base + int(video_id)` and store `frame_indices` + hashes in cache meta; training must hard-fail if mismatched.
 
 ---
 
@@ -135,7 +137,7 @@ PASS when:
 Implement: `src/data/ssv2_dataset.py`
 PASS when:
 - A batch returns `video` tensor shaped [B, C, num_frames, H, W] with C=3.
-- Deterministic sampling: with fixed seed and same index, frame IDs are identical.
+- Deterministic sampling: with fixed seed_base and the same `video_id`, frame IDs are identical (independent of dataset ordering/sharding).
 
 ### M2 -- Teacher forward + projection produces correct target shapes
 Implement: `src/models/teacher_videomae.py`

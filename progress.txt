@@ -5,7 +5,7 @@ Goal
 - Train a hybrid ST-Transformer student to predict frozen VideoMAE-H teacher latents (cached) on SSv2, then evaluate with lightweight probes.
 
 Current implementation status
-- Data: SSv2 loader with deterministic sampling + transforms, returns [B, 3, 16, 224, 224].
+- Data: SSv2 loader with deterministic sampling + transforms, returns [B, 3, 16, 224, 224] with view locked by clip id and validated against cache metadata.
 - Teacher: HF VideoMAE-H wrapper, CLS dropped, fixed projection W 1280->384 saved to disk for caching.
 - Cache: zarr targets [num_samples, 1568, 384] float16 + meta.jsonl mapping.
 - Student: D=384, depth=12, heads=6; hybrid attention (8 factorized + 4 joint) + 4-layer predictor.
